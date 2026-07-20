@@ -56,10 +56,9 @@ reqInfo = '''
 '''
 
 # Parse args
-usage = '%(prog)s [OPTIONS] <printer IP address>'
 description = 'A platform independent tool for updating Brother firmwares'
 
-parser = argparse.ArgumentParser(usage = usage, description = description)
+parser = argparse.ArgumentParser(description = description)
 
 parser.add_argument('ip', metavar = 'IP', help = 'printer IP address')
 parser.add_argument('-v', '--verbose', action = 'store_true',
