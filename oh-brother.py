@@ -293,11 +293,12 @@ def update_firmware(cat, version):
   sys.stdout.flush()
 
   if args.password is None:
-    ai = socket.getaddrinfo(args.ip, 9100, proto=socket.SOL_TCP)[0]
     try:
+      ai = socket.getaddrinfo(args.ip, 9100, proto = socket.SOL_TCP)[0]
       with socket.socket(ai[0], ai[1], ai[2]) as sock:
         sock.connect(ai[4])
-        sock.sendfile(open(filename, 'rb'))
+        with open(filename, 'rb') as fw:
+          sock.sendfile(fw)
 
     except OSError as e:
       print('Firmware update aborted due to error while uploading')
