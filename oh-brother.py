@@ -24,6 +24,7 @@ from ftplib import FTP
 import ssl
 import getpass
 import os
+import tempfile
 from functools import wraps
 
 
@@ -246,11 +247,16 @@ def update_firmware(cat, version):
 
   firmwareURL = firmwareURL.text
   filename = firmwareURL.split('/')[-1]
+  filepath = os.path.join(tempfile.gettempdir(), filename)
 
-  if args.dry_run:
+  if args.dry_run or args.test:
+    if args.dry_run:
+      label = 'dry-run'
+    else:
+      label = 'test'
     print('Firmware update available: %s' % filename)
     print('  URL: %s' % firmwareURL)
-    print('  (dry-run: not downloading)')
+    print('  (%s: not downloading)' % label)
     return
 
   # Download firmware
@@ -261,7 +267,7 @@ def update_firmware(cat, version):
     req = urllib.request.Request(firmwareURL)
     response = urllib.request.urlopen(req, timeout = 60)
 
-    with open(filename, 'wb') as f:
+    with open(filepath, 'wb') as f:
       while True:
         block = response.read(102400)
         if not block: break
@@ -274,10 +280,8 @@ def update_firmware(cat, version):
   print('done')
 
   # Safety check: verify file isn't empty before uploading to printer
-  if os.path.getsize(filename) == 0:
+  if os.path.getsize(filepath) == 0:
     raise Exception('Downloaded firmware file is empty, refusing to upload')
-
-  if args.test: return
 
   print('About to upload the firmware to printer.')
   print('This is a dangerous action since it is potentially destructive.')
@@ -297,7 +301,7 @@ def update_firmware(cat, version):
       ai = socket.getaddrinfo(args.ip, 9100, proto = socket.SOL_TCP)[0]
       with socket.socket(ai[0], ai[1], ai[2]) as sock:
         sock.connect(ai[4])
-        with open(filename, 'rb') as fw:
+        with open(filepath, 'rb') as fw:
           sock.sendfile(fw)
 
     except OSError as e:
@@ -305,11 +309,11 @@ def update_firmware(cat, version):
       print(e)
   else:
     try:
-      ftp = FTP(args.ip, user = args.password) # Yes send password as user
-      ftp.storbinary('STOR ' + filename, open(filename, 'rb'))
+      ftp = FTP(args.ip, user = args.password, timeout = 30) # Yes send password as user
+      ftp.storbinary('STOR ' + filename, open(filepath, 'rb'))
       ftp.quit()
-    except ConnectionRefusedError as e:
-      print('Firmware update aborted due to connection refused')
+    except Exception as e:
+      print('Firmware update aborted due to FTP error: %s' % e)
 
   print('done')
   print()
