@@ -228,7 +228,10 @@ def update_firmware(cat, version):
   if args.verbose: print('response: %s' % response)
 
   # Parse response
-  xml = ET.fromstring(response)
+  try:
+    xml = ET.fromstring(response)
+  except ET.ParseError as e:
+    raise Exception('Failed to parse Brother firmware server response: %s' % e)
 
   # Check version
   versionCheck = xml.find('FIRMUPDATEINFO/VERSIONCHECK')
