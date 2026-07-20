@@ -33,6 +33,8 @@ from functools import wraps
 # is a spelling issue crime committed by original vendor parts
 # and thus expected to remain exactly as wrongly written.
 # Thus it obviously should *not* be "corrected" here.
+# Note: OS value is 'WIN_NATIVE' regardless of actual platform — this is
+# what Brother's firmware server expects; changing it may break responses.
 reqInfo = '''
 <REQUESTINFO>
   <FIRMUPDATETOOLINFO>
