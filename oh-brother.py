@@ -24,6 +24,7 @@ import socket
 from ftplib import FTP
 import ssl
 import getpass
+import os
 from functools import wraps
 
 
@@ -81,6 +82,8 @@ parser.add_argument('--beta', action = 'store_true',
 parser.add_argument('-p', '--password',
                     help = 'Upload firmware via FTP using printer admin password '
                     '(default is passwordless upload via TCP port 9100)')
+parser.add_argument('-y', '--yes', action = 'store_true',
+                    help = 'Skip all confirmation prompts (non-interactive mode)')
 
 args = parser.parse_args()
 
@@ -90,7 +93,8 @@ print('  - SNMP service is enabled (for fetching model and versions)')
 if args.password:
   print('  - FTP service is enabled (for uploading firmware)')
   print('  - an administrator password is set (for connecting to FTP)')
-input('Press Ctrl-C to exit or Enter to continue...')
+if not args.yes:
+  input('Press Ctrl-C to exit or Enter to continue...')
 
 # Get SNMP data
 print('Getting SNMP data from printer at %s...' % args.ip)
@@ -210,9 +214,12 @@ def update_firmware(cat, version):
   print('Looking up printer firmware info at vendor server...')
   sys.stdout.flush()
 
-  req = urllib.request.Request(url, requestInfo, hdrs)
-  response = urllib.request.urlopen(req)
-  response = response.read()
+  try:
+    req = urllib.request.Request(url, requestInfo, hdrs)
+    response = urllib.request.urlopen(req, timeout = 30)
+    response = response.read()
+  except Exception as e:
+    raise Exception('Failed to contact Brother firmware server: %s' % e)
 
   print('done')
 
@@ -237,23 +244,28 @@ def update_firmware(cat, version):
   filename = firmwareURL.split('/')[-1]
 
   # Download firmware
-  f = open(filename, 'wb')
-
   print('Downloading firmware file %s from vendor server...' % filename)
   sys.stdout.flush()
 
-  req = urllib.request.Request(firmwareURL)
-  response = urllib.request.urlopen(req)
+  try:
+    req = urllib.request.Request(firmwareURL)
+    response = urllib.request.urlopen(req, timeout = 60)
 
-  while True:
-    block = response.read(102400)
-    if not block: break
-    f.write(block)
-    sys.stdout.write('.')
-    sys.stdout.flush()
+    with open(filename, 'wb') as f:
+      while True:
+        block = response.read(102400)
+        if not block: break
+        f.write(block)
+        sys.stdout.write('.')
+        sys.stdout.flush()
+  except Exception as e:
+    raise Exception('Failed to download firmware: %s' % e)
 
   print('done')
-  f.close()
+
+  # Safety check: verify file isn't empty before uploading to printer
+  if os.path.getsize(filename) == 0:
+    raise Exception('Downloaded firmware file is empty, refusing to upload')
 
   if args.test: return
 
@@ -263,7 +275,8 @@ def update_firmware(cat, version):
   print('- firmware file version is compatible with your hardware')
   print('- network connection is reliable (prefer wired connection to WLAN)')
   print('- power is reliable')
-  input('Press Ctrl-C to prevent upgrade or Enter to continue...')
+  if not args.yes:
+    input('Press Ctrl-C to prevent upgrade or Enter to continue...')
 
   # Upload firmware to printer
   print('Now uploading firmware to printer (DO NOT REMOVE POWER!)...')
@@ -290,7 +303,8 @@ def update_firmware(cat, version):
   print('done')
   print()
   print('Wait for printer to finish updating and reboot before continuing.')
-  input('Press Enter to continue...')
+  if not args.yes:
+    input('Press Enter to continue...')
 
 for entry in firmInfo:
   print()
