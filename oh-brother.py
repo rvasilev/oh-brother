@@ -237,13 +237,13 @@ def update_firmware(cat, version):
   versionCheck = xml.find('FIRMUPDATEINFO/VERSIONCHECK')
   if versionCheck is not None and versionCheck.text == '1':
     print('Firmware already up to date')
-    return
+    return False
 
   # Get firmware URL
   firmwareURL = xml.find('FIRMUPDATEINFO/PATH')
   if firmwareURL is None:
     print('No firmware update info path found')
-    return
+    return False
 
   firmwareURL = firmwareURL.text
   filename = firmwareURL.split('/')[-1]
@@ -257,7 +257,7 @@ def update_firmware(cat, version):
     print('Firmware update available: %s' % filename)
     print('  URL: %s' % firmwareURL)
     print('  (%s: not downloading)' % label)
-    return
+    return False
 
   # Download firmware
   print('Downloading firmware file %s from vendor server...' % filename)
@@ -277,6 +277,7 @@ def update_firmware(cat, version):
   except Exception as e:
     raise Exception('Failed to download firmware: %s' % e)
 
+  print()
   print('done')
 
   # Safety check: verify file isn't empty before uploading to printer
@@ -302,7 +303,10 @@ def update_firmware(cat, version):
       with socket.socket(ai[0], ai[1], ai[2]) as sock:
         sock.connect(ai[4])
         with open(filepath, 'rb') as fw:
-          sock.sendfile(fw)
+          while True:
+            chunk = fw.read(102400)
+            if not chunk: break
+            sock.sendall(chunk)
 
     except OSError as e:
       print('Firmware update aborted due to error while uploading')
@@ -321,9 +325,16 @@ def update_firmware(cat, version):
   if not args.yes:
     input('Press Enter to continue...')
 
+  return True
+
+updated = False
 for entry in firmInfo:
   print()
-  update_firmware(entry['cat'], entry['version'])
+  if update_firmware(entry['cat'], entry['version']):
+    updated = True
 
 print()
-print('Success')
+if updated:
+  print('Success')
+else:
+  print('No firmware updates were applied')
