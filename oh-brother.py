@@ -21,11 +21,9 @@ import argparse
 import sys
 import socket
 from ftplib import FTP
-import ssl
 import getpass
 import os
 import tempfile
-from functools import wraps
 
 
 # Yes indeed, "SELIALNO"
@@ -159,19 +157,6 @@ for entry in firmInfo:
   print('    category = %(cat)s, version = %(version)s' % entry)
 
 print()
-
-
-# We need SSLv3
-def sslwrap(func):
-  @wraps(func)
-  def bar(*args, **kw):
-    kw['ssl_version'] = ssl.PROTOCOL_TLS_CLIENT
-    return func(*args, **kw)
-
-  return bar
-
-context = ssl.create_default_context()
-ssl.wrap_socket = sslwrap(context.wrap_socket)
 
 
 def update_firmware(cat, version):
