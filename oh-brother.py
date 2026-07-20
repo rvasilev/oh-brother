@@ -15,9 +15,8 @@
 # GNU General Public License for more details.
 
 from pysnmp.entity.rfc3413.oneliner import cmdgen
-import urllib.request, urllib.error, urllib.parse
+import urllib.request, urllib.parse
 import xml.etree.ElementTree as ET
-import xml.dom.minidom as minidom
 import argparse
 import sys
 import socket
