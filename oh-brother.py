@@ -75,6 +75,9 @@ parser.add_argument('-f', '--version', default = 'B0000000000',
                     'with --category')
 parser.add_argument('-t', '--test', action = 'store_true',
                     help = 'Test only, don\'t do upgrades')
+parser.add_argument('-n', '--dry-run', action = 'store_true',
+                    help = 'Check for firmware updates without downloading '
+                    'anything')
 parser.add_argument('--beta', action = 'store_true',
                     help = 'Download the latest beta firmware instead of the '
                     'default stable version.')
@@ -241,6 +244,12 @@ def update_firmware(cat, version):
 
   firmwareURL = firmwareURL.text
   filename = firmwareURL.split('/')[-1]
+
+  if args.dry_run:
+    print('Firmware update available: %s' % filename)
+    print('  URL: %s' % firmwareURL)
+    print('  (dry-run: not downloading)')
+    return
 
   # Download firmware
   print('Downloading firmware file %s from vendor server...' % filename)
