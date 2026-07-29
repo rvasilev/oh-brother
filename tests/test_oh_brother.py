@@ -718,3 +718,58 @@ class TestTcpUpload:
 
         result = oh._tcp_upload(str(fw_path), "1.2.3.4", mock_sock)
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# _verify_firmware_integrity
+# ---------------------------------------------------------------------------
+
+class TestVerifyFirmwareIntegrity:
+    """Tests for firmware file integrity checks."""
+
+    def test_content_length_match(self, tmp_path):
+        """Content-Length matches file size — passes."""
+        fw_path = tmp_path / "test.djf"
+        fw_path.write_bytes(b"\x00" * 204800)  # 200KB
+
+        valid, err = oh._verify_firmware_integrity(
+            str(fw_path), content_length=204800
+        )
+        assert valid is True
+        assert err is None
+
+    def test_content_length_mismatch(self, tmp_path):
+        """Content-Length doesn't match — fails."""
+        fw_path = tmp_path / "test.djf"
+        fw_path.write_bytes(b"\x00" * 200000)
+
+        valid, err = oh._verify_firmware_integrity(
+            str(fw_path), content_length=300000
+        )
+        assert valid is False
+        assert "size mismatch" in err.lower()
+
+    def test_file_too_small(self, tmp_path):
+        """File smaller than 100KB minimum — fails."""
+        fw_path = tmp_path / "test.djf"
+        fw_path.write_bytes(b"\x00" * 50000)  # 50KB
+
+        valid, err = oh._verify_firmware_integrity(str(fw_path))
+        assert valid is False
+        assert "too small" in err.lower()
+
+    def test_minimum_size_pass(self, tmp_path):
+        """File at exactly 100KB — passes with no Content-Length."""
+        fw_path = tmp_path / "test.djf"
+        fw_path.write_bytes(b"\x00" * 102400)  # 100KB
+
+        valid, err = oh._verify_firmware_integrity(str(fw_path))
+        assert valid is True
+
+    def test_size_gate_only(self, tmp_path):
+        """No Content-Length provided — uses size gate only."""
+        fw_path = tmp_path / "test.djf"
+        fw_path.write_bytes(b"\x00" * 500000)  # 500KB
+
+        valid, err = oh._verify_firmware_integrity(str(fw_path))
+        assert valid is True

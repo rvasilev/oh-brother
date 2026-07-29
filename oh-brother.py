@@ -242,6 +242,32 @@ def _tcp_upload(filename, ip, sock):
     return True
 
 
+def _verify_firmware_integrity(filepath, content_length=None):
+    """Verify downloaded firmware file integrity.
+    
+    Checks: minimum size (100KB), Content-Length match if provided.
+    Returns: (is_valid: bool, error_message: str or None)
+    """
+    MIN_FIRMWARE_SIZE = 102400  # 100KB — no real Brother firmware is smaller
+    
+    try:
+        actual_size = os.path.getsize(filepath)
+    except OSError as e:
+        return False, "cannot stat file: %s" % e
+    
+    if actual_size < MIN_FIRMWARE_SIZE:
+        return False, "file too small: %d bytes (minimum %d)" % (
+            actual_size, MIN_FIRMWARE_SIZE)
+    
+    if content_length is not None:
+        expected_size = int(content_length)
+        if actual_size != expected_size:
+            return False, "size mismatch: expected %d bytes, got %d" % (
+                expected_size, actual_size)
+    
+    return True, None
+
+
 def update_firmware(cat, version):
   global args
 
@@ -332,6 +358,7 @@ def update_firmware(cat, version):
 
   req = urllib.request.Request(firmwareURL)
   response = urllib.request.urlopen(req, timeout=30)
+  content_length = response.headers.get('Content-Length')
 
   with open(filename, 'wb') as f:
     while True:
@@ -343,8 +370,10 @@ def update_firmware(cat, version):
 
   print('done')
 
-  if os.path.getsize(filename) < 1024:
-    print('Error: downloaded firmware file is too small (possibly corrupt)')
+  # Verify firmware file integrity
+  valid, err = _verify_firmware_integrity(filename, content_length=content_length)
+  if not valid:
+    print('Error: firmware integrity check failed: %s' % err)
     os.remove(filename)
     return False
 
