@@ -811,3 +811,100 @@ class TestVerifyFirmwareIntegrity:
 
         valid, err = oh._verify_firmware_integrity(str(fw_path))
         assert valid is True
+
+
+# ---------------------------------------------------------------------------
+# _http_post — HTTP error handling (P1: SSL #42, P2: HTTP errors #51)
+# ---------------------------------------------------------------------------
+
+class TestHttpPost:
+    """Tests for _http_post error handling."""
+
+    def test_success(self, monkeypatch):
+        """Successful POST returns response bytes."""
+        from unittest.mock import MagicMock
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"<xml>ok</xml>"
+
+        def fake_urlopen(req, timeout=None, context=None):
+            return mock_resp
+
+        monkeypatch.setattr(oh.urllib.request, "urlopen", fake_urlopen)
+
+        data, err = oh._http_post("https://test.local", b"<req/>",
+                                  {"Content-Type": "text/xml"})
+        assert data == b"<xml>ok</xml>"
+        assert err is None
+
+    def test_http_503(self, monkeypatch):
+        """HTTP 503 returns None + error message."""
+        from unittest.mock import MagicMock
+        import urllib.error
+
+        def fake_urlopen(req, timeout=None, context=None):
+            raise urllib.error.HTTPError(
+                "https://test.local", 503, "Service Unavailable", {}, None
+            )
+
+        monkeypatch.setattr(oh.urllib.request, "urlopen", fake_urlopen)
+
+        data, err = oh._http_post("https://test.local", b"<req/>",
+                                  {"Content-Type": "text/xml"})
+        assert data is None
+        assert "503" in err
+        assert "brother server" in err.lower()
+
+    def test_ssl_cert_error(self, monkeypatch):
+        """SSL certificate error returns None + cert guidance."""
+        from unittest.mock import MagicMock
+        import urllib.error
+        import ssl
+
+        def fake_urlopen(req, timeout=None, context=None):
+            raise urllib.error.URLError(
+                ssl.SSLCertVerificationError(
+                    "certificate verify failed: unable to get local issuer certificate"
+                )
+            )
+
+        monkeypatch.setattr(oh.urllib.request, "urlopen", fake_urlopen)
+
+        data, err = oh._http_post("https://test.local", b"<req/>",
+                                  {"Content-Type": "text/xml"})
+        assert data is None
+        assert "ssl" in err.lower() or "certificate" in err.lower()
+
+    def test_timeout(self, monkeypatch):
+        """Socket timeout returns None + network guidance."""
+        from unittest.mock import MagicMock
+        import urllib.error
+        import socket
+
+        def fake_urlopen(req, timeout=None, context=None):
+            raise urllib.error.URLError(socket.timeout("timed out"))
+
+        monkeypatch.setattr(oh.urllib.request, "urlopen", fake_urlopen)
+
+        data, err = oh._http_post("https://test.local", b"<req/>",
+                                  {"Content-Type": "text/xml"})
+        assert data is None
+        assert "timeout" in err.lower() or "network" in err.lower()
+
+    def test_dns_failure(self, monkeypatch):
+        """DNS failure returns None + network guidance."""
+        from unittest.mock import MagicMock
+        import urllib.error
+        import socket
+
+        def fake_urlopen(req, timeout=None, context=None):
+            raise urllib.error.URLError(
+                socket.gaierror("Name or service not known")
+            )
+
+        monkeypatch.setattr(oh.urllib.request, "urlopen", fake_urlopen)
+
+        data, err = oh._http_post("https://test.local", b"<req/>",
+                                  {"Content-Type": "text/xml"})
+        assert data is None
+        assert "network" in err.lower() or "dns" in err.lower() or "connect" in err.lower()

@@ -23,6 +23,7 @@ import xml.etree.ElementTree as ET
 import argparse
 import sys
 import socket
+import ssl
 import os
 import time
 from ftplib import FTP
@@ -268,6 +269,46 @@ def _verify_firmware_integrity(filepath, content_length=None):
     return True, None
 
 
+def _http_post(url, data, hdrs, timeout=30):
+    """POST data to a URL with comprehensive error handling.
+    
+    Returns: (response_bytes, None) on success, (None, error_message) on failure.
+    Handles: HTTP errors (4xx/5xx), SSL certificate errors, timeouts, DNS failures.
+    """
+    try:
+        req = urllib.request.Request(url, data, hdrs)
+        response = urllib.request.urlopen(req, timeout=timeout)
+        return response.read(), None
+    except urllib.error.HTTPError as e:
+        return None, (
+            "HTTP %d (%s) from Brother server — "
+            "the firmware service may be temporarily unavailable. "
+            "Try again later." % (e.code, e.reason)
+        )
+    except urllib.error.URLError as e:
+        reason = e.reason
+        # SSL certificate verification failure (common on macOS/portable Python)
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            return None, (
+                "SSL certificate verification failed — your Python install "
+                "may be missing CA certificates.\n"
+                "  macOS: run /Applications/Python*/Install Certificates.command\n"
+                "  Linux: install ca-certificates package\n"
+                "  Or: pip install certifi"
+            )
+        # Timeout
+        if isinstance(reason, socket.timeout):
+            return None, (
+                "Connection timed out — check your network and "
+                "try again. The Brother firmware server may be slow."
+            )
+        # Other network errors (DNS, connection refused, etc.)
+        return None, (
+            "Network error: %s — check your internet connection "
+            "and try again." % reason
+        )
+
+
 def update_firmware(cat, version):
   global args
 
@@ -285,9 +326,10 @@ def update_firmware(cat, version):
   print('Looking up printer firmware info at vendor server...')
   sys.stdout.flush()
 
-  req = urllib.request.Request(url, requestInfo, hdrs)
-  response = urllib.request.urlopen(req, timeout=30)
-  response = response.read()
+  response, http_err = _http_post(url, requestInfo, hdrs)
+  if response is None:
+    print('Error: %s' % http_err)
+    return False
 
   print('done')
 
@@ -304,9 +346,10 @@ def update_firmware(cat, version):
       if args.verbose:
         print('Retrying with version %s to get firmware URL...' % fallback_ver)
       fallback_req = build_firmware_xml(model, spec, cat, fallback_ver, beta=args.beta)
-      req2 = urllib.request.Request(url, fallback_req, hdrs)
-      resp2 = urllib.request.urlopen(req2, timeout=30)
-      resp2 = resp2.read()
+      resp2, http_err2 = _http_post(url, fallback_req, hdrs)
+      if resp2 is None:
+        print('Error on fallback: %s' % http_err2)
+        return False
       if args.verbose: print('fallback response: %s' % resp2)
       result2 = parse_brother_response(resp2)
       if result2['firmware_url']:
@@ -324,9 +367,10 @@ def update_firmware(cat, version):
       if args.verbose:
         print('Retrying with version %s to get firmware URL...' % fallback_ver)
       fallback_req = build_firmware_xml(model, spec, cat, fallback_ver, beta=args.beta)
-      req2 = urllib.request.Request(url, fallback_req, hdrs)
-      resp2 = urllib.request.urlopen(req2, timeout=30)
-      resp2 = resp2.read()
+      resp2, http_err2 = _http_post(url, fallback_req, hdrs)
+      if resp2 is None:
+        print('Error on fallback: %s' % http_err2)
+        return False
       if args.verbose: print('fallback response: %s' % resp2)
       result2 = parse_brother_response(resp2)
       if result2['firmware_url']:
