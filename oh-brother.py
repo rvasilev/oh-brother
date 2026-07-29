@@ -59,6 +59,12 @@ reqInfo = '''
 </REQUESTINFO>
 '''
 
+BROTHER_API_URL = (
+    'https://firmverup.brother.co.jp/'
+    'kne_bh7_update_nt_ssl/ifax2.asmx/fileUpdate'
+)
+BROTHER_SNMP_OID = '1.3.6.1.4.1.2435.2.4.3.99.3.1.6.1.2'
+
 
 def parse_snmp_table(table, verbose=False):
     """Parse SNMP walk result table into model/serial/spec/firmware info.
@@ -105,7 +111,6 @@ def build_firmware_xml(model, spec, category, version, beta=False):
     
     Returns: bytes (UTF-8 encoded XML)
     """
-    import xml.etree.ElementTree as ET
     # Use the module-level reqInfo template
     xml = ET.ElementTree(ET.fromstring(reqInfo))
     
@@ -131,7 +136,6 @@ def parse_brother_response(xml_bytes):
         version_check: str or None — '1' means up to date
         firmware_url: str or None — download URL if update available
     """
-    import xml.etree.ElementTree as ET
     
     try:
         xml = ET.fromstring(xml_bytes)
@@ -276,8 +280,17 @@ def _http_post(url, data, hdrs, timeout=30):
     Returns: (response_bytes, None) on success, (None, error_message) on failure.
     Handles: HTTP errors (4xx/5xx), SSL certificate errors, timeouts, DNS failures.
     """
+    return _http_request(url, data, hdrs, timeout=timeout)
+
+
+def _http_request(url, data=None, hdrs=None, timeout=30):
+    """HTTP request (POST if data provided, GET otherwise) with error handling.
+    
+    Returns: (response_bytes, None) on success, (None, error_message) on failure.
+    """
     try:
-        req = urllib.request.Request(url, data, hdrs)
+        req = urllib.request.Request(url, data, hdrs) if data else \
+             urllib.request.Request(url, headers=hdrs or {})
         response = urllib.request.urlopen(req, timeout=timeout)
         return response.read(), None
     except urllib.error.HTTPError as e:
@@ -288,7 +301,6 @@ def _http_post(url, data, hdrs, timeout=30):
         )
     except urllib.error.URLError as e:
         reason = e.reason
-        # SSL certificate verification failure (common on macOS/portable Python)
         if isinstance(reason, ssl.SSLCertVerificationError):
             return None, (
                 "SSL certificate verification failed — your Python install "
@@ -297,17 +309,37 @@ def _http_post(url, data, hdrs, timeout=30):
                 "  Linux: install ca-certificates package\n"
                 "  Or: pip install certifi"
             )
-        # Timeout
         if isinstance(reason, socket.timeout):
             return None, (
                 "Connection timed out — check your network and "
                 "try again. The Brother firmware server may be slow."
             )
-        # Other network errors (DNS, connection refused, etc.)
         return None, (
             "Network error: %s — check your internet connection "
             "and try again." % reason
         )
+
+
+def _try_version_fallback(version, cat, url, hdrs):
+    """Try to get firmware URL by requesting an older version.
+    
+    Decrements the version number and queries the Brother API.
+    Returns firmware URL string on success, None on failure.
+    """
+    fallback_ver = _decrement_version(version)
+    if not fallback_ver:
+        return None
+    if args.verbose:
+        print('Retrying with version %s to get firmware URL...' % fallback_ver)
+    req = build_firmware_xml(model, spec, cat, fallback_ver, beta=args.beta)
+    resp, err = _http_post(url, req, hdrs)
+    if resp is None:
+        print('Error on fallback: %s' % err)
+        return None
+    if args.verbose:
+        print('fallback response: %s' % resp)
+    result = parse_brother_response(resp)
+    return result.get('firmware_url')
 
 
 def update_firmware(cat, version):
@@ -320,8 +352,7 @@ def update_firmware(cat, version):
   if args.verbose: print('request: %s' % requestInfo)
 
   # Request firmware data
-  url = 'https://firmverup.brother.co.jp/'
-  url += 'kne_bh7_update_nt_ssl/ifax2.asmx/fileUpdate'
+  url = BROTHER_API_URL
   hdrs = {'Content-Type': 'text/xml', 'User-Agent': 'BrHttpc/1.00'}
 
   print('Looking up printer firmware info at vendor server...')
@@ -339,46 +370,18 @@ def update_firmware(cat, version):
   result = parse_brother_response(response)
   if result['version_check'] == '1':
     print('Firmware already up to date')
-    # Try version fallback: newer Brother printers return no PATH when
-    # already current. Sending an older version forces the API to return
-    # the PATH for the current firmware (useful for backup/download).
-    fallback_ver = _decrement_version(version)
-    if fallback_ver:
-      if args.verbose:
-        print('Retrying with version %s to get firmware URL...' % fallback_ver)
-      fallback_req = build_firmware_xml(model, spec, cat, fallback_ver, beta=args.beta)
-      resp2, http_err2 = _http_post(url, fallback_req, hdrs)
-      if resp2 is None:
-        print('Error on fallback: %s' % http_err2)
-        return False
-      if args.verbose: print('fallback response: %s' % resp2)
-      result2 = parse_brother_response(resp2)
-      if result2['firmware_url']:
-        firmwareURL = result2['firmware_url']
-        print('Found firmware URL via version fallback')
-      else:
-        return False
+    # Try version fallback to get firmware URL for backup/download
+    firmwareURL = _try_version_fallback(version, cat, url, hdrs)
+    if firmwareURL:
+      print('Found firmware URL via version fallback')
     else:
       return False
   elif result['firmware_url'] is None:
     print('No firmware update info path found '
           '(newer Brother models require version fallback)')
-    fallback_ver = _decrement_version(version)
-    if fallback_ver:
-      if args.verbose:
-        print('Retrying with version %s to get firmware URL...' % fallback_ver)
-      fallback_req = build_firmware_xml(model, spec, cat, fallback_ver, beta=args.beta)
-      resp2, http_err2 = _http_post(url, fallback_req, hdrs)
-      if resp2 is None:
-        print('Error on fallback: %s' % http_err2)
-        return False
-      if args.verbose: print('fallback response: %s' % resp2)
-      result2 = parse_brother_response(resp2)
-      if result2['firmware_url']:
-        firmwareURL = result2['firmware_url']
-        print('Found firmware URL via version fallback')
-      else:
-        return False
+    firmwareURL = _try_version_fallback(version, cat, url, hdrs)
+    if firmwareURL:
+      print('Found firmware URL via version fallback')
     else:
       return False
   else:
@@ -401,8 +404,16 @@ def update_firmware(cat, version):
   print('Downloading firmware file %s from vendor server...' % filename)
   sys.stdout.flush()
 
-  req = urllib.request.Request(firmwareURL)
-  response = urllib.request.urlopen(req, timeout=30)
+  try:
+    req = urllib.request.Request(firmwareURL)
+    response = urllib.request.urlopen(req, timeout=30)
+  except urllib.error.HTTPError as e:
+    print('Error: HTTP %d (%s) from Brother CDN — try again later.' % (e.code, e.reason))
+    return False
+  except urllib.error.URLError as e:
+    print('Error: download failed — %s' % e.reason)
+    return False
+
   content_length = response.headers.get('Content-Length')
 
   with open(filename, 'wb') as f:
@@ -521,8 +532,8 @@ def main():
         print('You may need to check the following in the printer\'s configuration:')
         print('  - SNMP service is enabled (for fetching model and versions)')
         if args.password:
-          print('  - FTP service is enabled (for uploading firmware)')
-          print('  - an administrator password is set (for connecting to FTP)')
+            print('  - FTP service is enabled (for uploading firmware)')
+            print('  - an administrator password is set (for connecting to FTP)')
         if not args.yes:
             prompt('Press Ctrl-C to exit or Enter to continue...')
 
@@ -531,8 +542,7 @@ def main():
         sys.stdout.flush()
 
         table = asyncio.run(_snmp_walk_table(
-            args.ip, args.community,
-            '1.3.6.1.4.1.2435.2.4.3.99.3.1.6.1.2',
+            args.ip, args.community, BROTHER_SNMP_OID,
         ))
 
         print('done')
@@ -549,7 +559,7 @@ def main():
 
         # Override category and version
         if args.category:
-          firmInfo = [{'cat': args.category, 'version': args.fw_version}]
+            firmInfo = [{'cat': args.category, 'version': args.fw_version}]
 
         # Print SNMP info
         print()
