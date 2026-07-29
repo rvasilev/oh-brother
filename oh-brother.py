@@ -14,13 +14,14 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 
-from pysnmp.hlapi import (
-    walkCmd, SnmpEngine, CommunityData, UdpTransportTarget,
-    ContextData, ObjectType, ObjectIdentity,
+from pysnmp.hlapi.v1arch import (
+    walk_cmd, CommunityData, UdpTransportTarget,
+    ObjectType, ObjectIdentity, SnmpDispatcher,
 )
 import urllib.request, urllib.error, urllib.parse
 import xml.etree.ElementTree as ET
 import argparse
+import asyncio
 import sys
 import socket
 import ssl
@@ -475,6 +476,41 @@ def update_firmware(cat, version):
   return True
 
 
+async def _snmp_walk_table(ip, community, oid):
+    """Walk an SNMP OID on a Brother printer using pysnmp 7.x async API.
+    
+    Returns: list of rows, each row is list of (oid_str, value_str) tuples.
+    Raises SystemExit on SNMP errors.
+    """
+    transport = await UdpTransportTarget.create(
+        (ip, 161), timeout=30
+    )
+    table = []
+    async for errorIndication, errorStatus, errorIndex, varBinds in walk_cmd(
+        SnmpDispatcher(),
+        CommunityData(community),
+        transport,
+        ObjectType(ObjectIdentity(oid)),
+        lexicographicMode=False,
+    ):
+        if errorIndication:
+            print(errorIndication, file=sys.stderr)
+            sys.exit(1)
+        if errorStatus:
+            print('ERROR: %s at %s' % (
+                errorStatus.prettyPrint(),
+                errorIndex and varBinds[int(errorIndex) - 1] or '?'),
+                file=sys.stderr)
+            sys.exit(1)
+        row = []
+        for varBind in varBinds:
+            oid_str = str(varBind[0])
+            val_str = str(varBind[1]) if varBind[1] is not None else ''
+            row.append((oid_str, val_str))
+        table.append(row)
+    return table
+
+
 def main():
     global args, serial, model, spec, firmInfo
 
@@ -494,30 +530,10 @@ def main():
         print('Getting SNMP data from printer at %s...' % args.ip)
         sys.stdout.flush()
 
-        table = []
-        for errorIndication, errorStatus, errorIndex, varBinds in walkCmd(
-            SnmpEngine(),
-            CommunityData(args.community),
-            UdpTransportTarget((args.ip, 161), timeout=30),
-            ContextData(),
-            ObjectType(ObjectIdentity('1.3.6.1.4.1.2435.2.4.3.99.3.1.6.1.2')),
-            lexicographicMode=False,
-        ):
-            if errorIndication:
-                print(errorIndication, file=sys.stderr)
-                sys.exit(1)
-            if errorStatus:
-                print('ERROR: %s at %s' % (
-                    errorStatus.prettyPrint(),
-                    errorIndex and varBinds[int(errorIndex) - 1] or '?'),
-                    file=sys.stderr)
-                sys.exit(1)
-            row = []
-            for varBind in varBinds:
-                oid = str(varBind[0])
-                val = str(varBind[1]) if varBind[1] is not None else ''
-                row.append((oid, val))
-            table.append(row)
+        table = asyncio.run(_snmp_walk_table(
+            args.ip, args.community,
+            '1.3.6.1.4.1.2435.2.4.3.99.3.1.6.1.2',
+        ))
 
         print('done')
 

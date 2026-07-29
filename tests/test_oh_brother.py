@@ -294,10 +294,12 @@ class TestMainSmoke:
         """main() extracts SNMP data then calls update_firmware for each category."""
         from unittest.mock import MagicMock
 
-        def fake_walkCmd(*args, **kwargs):
+        async def fake_walk_cmd(*args, **kwargs):
+            table = []
             for snmp_row in REAL_SNMP_TABLE:
                 varBinds = [(oid, val) for oid, val in snmp_row]
-                yield (None, None, None, varBinds)
+                table.append([(str(vb[0]), str(vb[1])) for vb in varBinds])
+            return table
 
         monkeypatch.setattr("builtins.input", lambda _=None: None)
 
@@ -306,7 +308,7 @@ class TestMainSmoke:
             called_with.append((cat, ver))
         monkeypatch.setattr(oh, "update_firmware", fake_update)
 
-        monkeypatch.setattr(oh, "walkCmd", fake_walkCmd)
+        monkeypatch.setattr(oh, "_snmp_walk_table", fake_walk_cmd)
         monkeypatch.setattr("sys.argv", ["oh-brother.py", "1.2.3.4"])
         oh.main()
 
@@ -316,10 +318,12 @@ class TestMainSmoke:
         """--model flag overrides SNMP-discovered model."""
         from unittest.mock import MagicMock
 
-        def fake_walkCmd(*args, **kwargs):
+        async def fake_walk_cmd(*args, **kwargs):
+            table = []
             for snmp_row in REAL_SNMP_TABLE:
                 varBinds = [(oid, val) for oid, val in snmp_row]
-                yield (None, None, None, varBinds)
+                table.append([(str(vb[0]), str(vb[1])) for vb in varBinds])
+            return table
 
         monkeypatch.setattr("builtins.input", lambda _=None: None)
         called_with = []
@@ -327,7 +331,7 @@ class TestMainSmoke:
             oh, "update_firmware", lambda c, v: called_with.append((c, v))
         )
 
-        monkeypatch.setattr(oh, "walkCmd", fake_walkCmd)
+        monkeypatch.setattr(oh, "_snmp_walk_table", fake_walk_cmd)
         monkeypatch.setattr(
             "sys.argv",
             ["oh-brother.py", "--model", "HL-9999", "1.2.3.4"],
@@ -340,10 +344,12 @@ class TestMainSmoke:
         """--category + --version replace all firmware entries."""
         from unittest.mock import MagicMock
 
-        def fake_walkCmd(*args, **kwargs):
+        async def fake_walk_cmd(*args, **kwargs):
+            table = []
             for snmp_row in REAL_SNMP_TABLE:
                 varBinds = [(oid, val) for oid, val in snmp_row]
-                yield (None, None, None, varBinds)
+                table.append([(str(vb[0]), str(vb[1])) for vb in varBinds])
+            return table
 
         monkeypatch.setattr("builtins.input", lambda _=None: None)
         called_with = []
@@ -351,7 +357,7 @@ class TestMainSmoke:
             oh, "update_firmware", lambda c, v: called_with.append((c, v))
         )
 
-        monkeypatch.setattr(oh, "walkCmd", fake_walkCmd)
+        monkeypatch.setattr(oh, "_snmp_walk_table", fake_walk_cmd)
         monkeypatch.setattr(
             "sys.argv",
             ["oh-brother.py", "--category", "SUB1", "--fw-version", "3.00", "1.2.3.4"],
@@ -364,12 +370,13 @@ class TestMainSmoke:
         """SNMP error raises Exception."""
         from unittest.mock import MagicMock
 
-        def fake_walkCmd(*args, **kwargs):
-            yield ("SNMP timeout", None, None, [])
+        async def fake_walk_cmd(*args, **kwargs):
+            print("SNMP timeout", file=sys.stderr)
+            sys.exit(1)
 
         monkeypatch.setattr("builtins.input", lambda _=None: None)
 
-        monkeypatch.setattr(oh, "walkCmd", fake_walkCmd)
+        monkeypatch.setattr(oh, "_snmp_walk_table", fake_walk_cmd)
         monkeypatch.setattr("sys.argv", ["oh-brother.py", "1.2.3.4"])
         with pytest.raises(SystemExit):
             oh.main()
@@ -379,12 +386,15 @@ class TestMainSmoke:
         from unittest.mock import MagicMock
 
         mock_status = MagicMock()
-        def fake_walkCmd(*args, **kwargs):
-            yield (None, mock_status, 1, [("1.2.3", "dummy")])
+        async def fake_walk_cmd(*args, **kwargs):
+            print('ERROR: %s at %s' % (
+                mock_status.prettyPrint(), '?.1.2.3'),
+                file=sys.stderr)
+            sys.exit(1)
 
         monkeypatch.setattr("builtins.input", lambda _=None: None)
 
-        monkeypatch.setattr(oh, "walkCmd", fake_walkCmd)
+        monkeypatch.setattr(oh, "_snmp_walk_table", fake_walk_cmd)
         monkeypatch.setattr("sys.argv", ["oh-brother.py", "1.2.3.4"])
         with pytest.raises(SystemExit):
             oh.main()
@@ -403,13 +413,15 @@ class TestMainSmoke:
             [("...7", 'FIRMVER="2.10"')],
         ]
 
-        def fake_walkCmd(*args, **kwargs):
+        async def fake_walk_cmd(*args, **kwargs):
+            table = []
             for snmp_row in multi_fw_table:
                 varBinds = [(oid, val) for oid, val in snmp_row]
-                yield (None, None, None, varBinds)
+                table.append([(str(vb[0]), str(vb[1])) for vb in varBinds])
+            return table
 
         monkeypatch.setattr("builtins.input", lambda _=None: None)
-        monkeypatch.setattr(oh, "walkCmd", fake_walkCmd)
+        monkeypatch.setattr(oh, "_snmp_walk_table", fake_walk_cmd)
         monkeypatch.setattr("sys.argv", ["oh-brother.py", "1.2.3.4"])
 
         called_with = []
