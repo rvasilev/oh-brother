@@ -24,7 +24,9 @@ import argparse
 import sys
 import socket
 import os
+import time
 from ftplib import FTP
+from urllib.parse import urlparse
 
 
 # Yes indeed, "SELIALNO"
@@ -199,6 +201,28 @@ def _decrement_version(version_str):
     return None
 
 
+def _validate_firmware_url(url):
+    """Validate firmware download URL for safety.
+    
+    Checks: non-empty, http/https scheme, known Brother CDN domain,
+    firmware file extension (.djf or .upd).
+    
+    Returns: (is_valid: bool, error_message: str or None)
+    """
+    if not url:
+        return False, "empty URL"
+    parsed = urlparse(url)
+    if parsed.scheme not in ('http', 'https'):
+        return False, "unexpected scheme: %s" % parsed.scheme
+    allowed_domains = ('brother.co.jp', 'brother.com', 'brother.eu')
+    if not any(parsed.netloc.endswith(d) for d in allowed_domains):
+        return False, "unexpected domain: %s" % parsed.netloc
+    path = parsed.path.lower()
+    if not (path.endswith('.djf') or path.endswith('.upd')):
+        return False, "unexpected file type: %s" % parsed.path
+    return True, None
+
+
 def update_firmware(cat, version):
   global args
 
@@ -269,7 +293,19 @@ def update_firmware(cat, version):
       return False
   else:
     firmwareURL = result['firmware_url']
-  filename = firmwareURL.split('/')[-1]
+
+  # Validate firmware URL before downloading
+  valid, err = _validate_firmware_url(firmwareURL)
+  if not valid:
+    print('Error: firmware URL validation failed: %s' % err)
+    print('URL: %s' % firmwareURL)
+    return False
+
+  # Extract filename from URL (strip query parameters)
+  filename = os.path.basename(urlparse(firmwareURL).path)
+  if not filename:
+    print('Error: could not extract filename from firmware URL')
+    return False
 
   # Download firmware
   print('Downloading firmware file %s from vendor server...' % filename)

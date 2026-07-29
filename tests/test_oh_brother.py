@@ -604,3 +604,68 @@ class TestDecrementVersion:
 
     def test_empty(self):
         assert oh._decrement_version("") is None
+
+
+# ---------------------------------------------------------------------------
+# _validate_firmware_url
+# ---------------------------------------------------------------------------
+
+class TestValidateFirmwareUrl:
+    def test_valid_brother_cdn_http(self):
+        """Standard Brother CDN URL over HTTP — should pass."""
+        valid, err = oh._validate_firmware_url(
+            "http://update-akamai.brother.co.jp/CS/D02FZM_124Q_crypt.djf"
+        )
+        assert valid is True
+        assert err is None
+
+    def test_valid_brother_cdn_https(self):
+        """HTTPS variant — should pass."""
+        valid, err = oh._validate_firmware_url(
+            "https://update-akamai.brother.co.jp/CS/D00XXX_A.djf"
+        )
+        assert valid is True
+        assert err is None
+
+    def test_valid_upd_extension(self):
+        """.upd files are valid Brother firmware."""
+        valid, err = oh._validate_firmware_url(
+            "http://download.brother.com/pub/HL1110_SUB1.upd"
+        )
+        assert valid is True
+
+    def test_wrong_domain(self):
+        """Non-Brother domain — should fail."""
+        valid, err = oh._validate_firmware_url(
+            "http://evil.com/firmware.djf"
+        )
+        assert valid is False
+        assert "domain" in err.lower()
+
+    def test_file_scheme(self):
+        """file:// URLs are not allowed."""
+        valid, err = oh._validate_firmware_url(
+            "file:///tmp/firmware.djf"
+        )
+        assert valid is False
+        assert "scheme" in err.lower()
+
+    def test_wrong_extension(self):
+        """Non-firmware extensions — should fail."""
+        valid, err = oh._validate_firmware_url(
+            "http://update-akamai.brother.co.jp/CS/readme.txt"
+        )
+        assert valid is False
+        assert "file type" in err.lower() or "extension" in err.lower()
+
+    def test_empty_url(self):
+        """Empty URL — should fail."""
+        valid, err = oh._validate_firmware_url("")
+        assert valid is False
+
+    def test_url_with_query_params(self):
+        """URL with query params — should still validate (extension before ?)."""
+        valid, err = oh._validate_firmware_url(
+            "http://update-akamai.brother.co.jp/CS/D00XXX_A.djf?token=abc"
+        )
+        assert valid is True
