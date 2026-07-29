@@ -223,6 +223,25 @@ def _validate_firmware_url(url):
     return True, None
 
 
+def _tcp_upload(filename, ip, sock):
+    """Upload firmware file to printer via TCP port 9100 with retry.
+    
+    Uses sendfile with offset tracking for short-write resilience.
+    Returns: True on success, False on failure.
+    """
+    fw_size = os.path.getsize(filename)
+    with open(filename, 'rb') as fw:
+        offset = 0
+        while offset < fw_size:
+            sent = sock.sendfile(fw, offset=offset)
+            if sent == 0:
+                print('Error: connection closed during firmware upload '
+                      '(sent %d of %d bytes)' % (offset, fw_size))
+                return False
+            offset += sent
+    return True
+
+
 def update_firmware(cat, version):
   global args
 
@@ -351,10 +370,9 @@ def update_firmware(cat, version):
     ai = socket.getaddrinfo(args.ip, 9100, proto=socket.SOL_TCP)[0]
     try:
       with socket.socket(ai[0], ai[1], ai[2]) as sock:
+        sock.settimeout(60)
         sock.connect(ai[4])
-        with open(filename, 'rb') as fw:
-          sock.sendfile(fw)
-      success = True
+        success = _tcp_upload(filename, args.ip, sock)
 
     except OSError as e:
       print('Firmware update aborted due to error while uploading')

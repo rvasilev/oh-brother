@@ -669,3 +669,52 @@ class TestValidateFirmwareUrl:
             "http://update-akamai.brother.co.jp/CS/D00XXX_A.djf?token=abc"
         )
         assert valid is True
+
+
+# ---------------------------------------------------------------------------
+# TCP upload (sendfile retry)
+# ---------------------------------------------------------------------------
+
+class TestTcpUpload:
+    """Tests for the TCP upload retry loop."""
+
+    def test_sendfile_full_success(self, monkeypatch, tmp_path):
+        """sendfile returns full file size in one call — success."""
+        from unittest.mock import MagicMock
+
+        fw_path = tmp_path / "test.djf"
+        fw_path.write_bytes(b"\x00" * 4096)
+
+        mock_sock = MagicMock()
+        mock_sock.sendfile.return_value = 4096
+
+        result = oh._tcp_upload(str(fw_path), "1.2.3.4", mock_sock)
+        assert result is True
+        assert mock_sock.sendfile.call_count == 1
+
+    def test_sendfile_short_write_retry(self, monkeypatch, tmp_path):
+        """sendfile returns partial bytes — retries until complete."""
+        from unittest.mock import MagicMock
+
+        fw_path = tmp_path / "test.djf"
+        fw_path.write_bytes(b"\x00" * 8192)
+
+        mock_sock = MagicMock()
+        mock_sock.sendfile.side_effect = [4096, 4096, 0]
+
+        result = oh._tcp_upload(str(fw_path), "1.2.3.4", mock_sock)
+        assert result is True
+        assert mock_sock.sendfile.call_count >= 2
+
+    def test_sendfile_zero_return_fails(self, monkeypatch, tmp_path):
+        """sendfile returns 0 — connection closed, should fail."""
+        from unittest.mock import MagicMock
+
+        fw_path = tmp_path / "test.djf"
+        fw_path.write_bytes(b"\x00" * 4096)
+
+        mock_sock = MagicMock()
+        mock_sock.sendfile.return_value = 0
+
+        result = oh._tcp_upload(str(fw_path), "1.2.3.4", mock_sock)
+        assert result is False
