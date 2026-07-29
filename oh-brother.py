@@ -504,10 +504,22 @@ def main():
         print()
 
         updated = False
-        for entry in firmInfo:
-          print()
-          if update_firmware(entry['cat'], entry['version']):
-            updated = True
+        num_firmwares = len(firmInfo)
+        if num_firmwares > 1:
+            print('WARNING: %d firmware updates pending. '
+                  'Printer may reboot between updates.' % num_firmwares)
+            print('A 30-second delay will be inserted between each update.')
+            if not args.yes:
+                prompt('Press Ctrl-C to abort or Enter to continue...')
+
+        for i, entry in enumerate(firmInfo):
+            print()
+            if update_firmware(entry['cat'], entry['version']):
+                updated = True
+                if i < num_firmwares - 1:
+                    print('Waiting 30 seconds for printer to stabilize...')
+                    sys.stdout.flush()
+                    time.sleep(30)
 
         print()
         if updated:

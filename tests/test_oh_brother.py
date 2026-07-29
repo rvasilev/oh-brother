@@ -389,6 +389,44 @@ class TestMainSmoke:
         with pytest.raises(SystemExit):
             oh.main()
 
+    def test_main_multiple_firmwares_with_delay(self, monkeypatch):
+        """Multiple firmwares — time.sleep called between updates."""
+        from unittest.mock import MagicMock
+
+        # SNMP data with MAIN + SUB1 firmware
+        multi_fw_table = [
+            [("...1", 'MODEL="HL-L2865DW"')],
+            [("...2", 'SPEC="0906"')],
+            [("...6", 'FIRMID="MAIN"')],
+            [("...7", 'FIRMVER="1.24"')],
+            [("...6", 'FIRMID="SUB1"')],
+            [("...7", 'FIRMVER="2.10"')],
+        ]
+
+        def fake_walkCmd(*args, **kwargs):
+            for snmp_row in multi_fw_table:
+                varBinds = [(oid, val) for oid, val in snmp_row]
+                yield (None, None, None, varBinds)
+
+        monkeypatch.setattr("builtins.input", lambda _=None: None)
+        monkeypatch.setattr(oh, "walkCmd", fake_walkCmd)
+        monkeypatch.setattr("sys.argv", ["oh-brother.py", "1.2.3.4"])
+
+        called_with = []
+        def fake_update(cat, ver):
+            called_with.append((cat, ver))
+            return True
+        monkeypatch.setattr(oh, "update_firmware", fake_update)
+
+        sleep_calls = []
+        monkeypatch.setattr(oh.time, "sleep", lambda s: sleep_calls.append(s))
+
+        oh.main()
+
+        assert called_with == [("MAIN", "1.24"), ("SUB1", "2.10")]
+        # Delay should be inserted between the two updates
+        assert len(sleep_calls) >= 1
+
 
 # ---------------------------------------------------------------------------
 # update_firmware()
