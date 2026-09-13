@@ -1,0 +1,29 @@
+# aislop configuration — see docs/audit-adoption-aislop-2026-09-13.md
+#
+# Measured baseline on this repo (aislop 0.16.1, 2026-09-13):
+#   default rules ..................... score 25 ("Critical"), 84 findings, of which
+#                                       56 were one rule (ruff/UP031) against the
+#                                       project's deliberate %-formatting house style
+#   with the three rules below off .... score 47, 20 findings, 0 true positives on
+#                                       existing hand-hardened code
+# The gate is therefore a ratchet set just under the measured baseline, and CI runs
+# it on CHANGED files only. Do not raise failBelow until the debt below is cleared.
+exclude:
+  - firmware_backups
+  - build
+  - "*.egg-info"
+
+rules:
+  # UP031 (printf-string-formatting): this codebase deliberately uses %-formatting
+  # throughout, matching upstream. 56 of the 84 default findings were this one rule.
+  ruff/UP031: "off"
+  # FURB167 (re.M -> re.MULTILINE): a readability preference, yet the default config
+  # classifies all 7 instances as errors.
+  ruff/FURB167: "off"
+  # EXE001: the checker is invoked as `python3 scripts/check_agents_md.py`.
+  ruff/EXE001: "off"
+
+ci:
+  # Baseline is 47. Set below it so existing debt does not fail CI, while any new
+  # finding on a changed file does. Raise as the accepted-findings list shrinks.
+  failBelow: 45
