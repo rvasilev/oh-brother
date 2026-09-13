@@ -1133,3 +1133,183 @@ class TestSafetyGates:
         assert oh._parse_artifact_version("D02FZM_124Q_crypt.djf") == "1.24"
         assert oh._parse_artifact_version("D00KJY_F") is None
         assert oh._parse_artifact_version("LZ2751_L") is None
+
+
+# ---------------------------------------------------------------------------
+# Firmware write-path hardening: retention, incomplete transfer, verification
+# ---------------------------------------------------------------------------
+
+def _fake_tcp_socket(monkeypatch, sendfile_side_effect=None):
+    """Install a fake raw-TCP socket and address lookup for update_firmware."""
+    from unittest.mock import MagicMock
+
+    sock = MagicMock()
+    sock.__enter__.return_value = sock
+    if sendfile_side_effect is not None:
+        sock.sendfile.side_effect = sendfile_side_effect
+    monkeypatch.setattr(
+        oh.socket, "getaddrinfo",
+        lambda *a, **k: [(2, 1, 6, '', ('1.2.3.4', 9100))])
+    monkeypatch.setattr(oh.socket, "socket", lambda *a: sock)
+    return sock
+
+
+class TestFlashHardening:
+    """Recovery-image retention, incomplete transfers, post-flash checks."""
+
+    def test_image_retained_on_upload_failure(self, monkeypatch, tmp_path):
+        """A failed upload keeps the image for a retry."""
+        oh.args = _args()
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, sock: False)
+        _fake_tcp_socket(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        assert result == oh.EXIT_UPLOAD
+
+        found = list(tmp_path.rglob("*.djf"))
+        assert len(found) == 1
+        assert found[0].read_bytes()
+
+    def test_test_mode_retains_artifact(self, monkeypatch, tmp_path):
+        """--test leaves the downloaded image on disk (it is the backup)."""
+        oh.args = _args(test=True)
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+        monkeypatch.chdir(tmp_path)
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_OK
+        assert list(tmp_path.rglob("*.djf"))
+        assert not list(tmp_path.rglob("*.part"))
+
+    def test_no_partial_file_under_real_firmware_name(self, monkeypatch, tmp_path):
+        """An interrupted download leaves no file at the real firmware name."""
+        from unittest.mock import MagicMock
+
+        oh.args = _args()
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+
+        resp = MagicMock()
+        resp.headers.get.return_value = None
+        resp.read.side_effect = [b"\x00" * 102400, OSError("connection reset")]
+        monkeypatch.setattr(oh.urllib.request, "urlopen", lambda *a, **k: resp)
+        monkeypatch.chdir(tmp_path)
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_DOWNLOAD
+        assert not (tmp_path / "D02FZM_124Q_crypt.djf").exists()
+        assert not list(tmp_path.rglob("*.part"))
+
+    def test_sendfile_timeout_after_progress_marked_incomplete(
+            self, monkeypatch, tmp_path, capsys):
+        """A timeout after bytes were accepted is INCOMPLETE, not a failure."""
+        oh.args = _args()
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+        _fake_tcp_socket(monkeypatch, sendfile_side_effect=[4096, TimeoutError("timed out")])
+        monkeypatch.chdir(tmp_path)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_UPLOAD
+        assert result != oh.EXIT_OK
+        assert "INCOMPLETE" in out
+        assert "DO NOT POWER OFF" in out
+        assert list(tmp_path.rglob("*.djf"))  # retained for reflash
+
+    def test_post_upload_version_verified_via_snmp(
+            self, monkeypatch, tmp_path, capsys):
+        """A matching post-flash version is a verified success."""
+        oh.args = _args(community="public")
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, sock: True)
+        monkeypatch.setattr(oh, "_query_printer_version",
+                            lambda ip, community, cat: "1.24")
+        _fake_tcp_socket(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_OK
+        assert "expected=1.24 actual=1.24" in out
+        assert not list(tmp_path.rglob("*.djf"))  # deleted after verified flash
+
+    def test_post_upload_version_mismatch_fails(
+            self, monkeypatch, tmp_path, capsys):
+        """A completed read with the wrong version is a real failure."""
+        oh.args = _args()
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, sock: True)
+        monkeypatch.setattr(oh, "_query_printer_version",
+                            lambda ip, community, cat: "1.20")
+        _fake_tcp_socket(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_UPLOAD
+        assert "expected=1.24 actual=1.20" in out
+        assert list(tmp_path.rglob("*.djf"))  # retained on real failure
+
+    def test_post_upload_unverifiable_is_not_failure(
+            self, monkeypatch, tmp_path, capsys):
+        """Not coming back within the deadline is UNVERIFIED, not a failure."""
+        oh.args = _args()
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+
+        monkeypatch.setattr(oh, "FLASH_VERIFY_TIMEOUT", 0)
+        monkeypatch.setattr(oh.time, "sleep", lambda s: None)
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, sock: True)
+        monkeypatch.setattr(oh, "_query_printer_version",
+                            lambda ip, community, cat: None)
+        _fake_tcp_socket(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_UNVERIFIED
+        assert result != oh.EXIT_UPLOAD
+        assert "could not be verified" in out
+        assert "FAILURE" not in out
+        assert list(tmp_path.rglob("*.djf"))  # retained
