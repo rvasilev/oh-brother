@@ -16,7 +16,7 @@ or FTP upload.
   must equal **`37f53a239b86f53d385d45047b8ceb07`**. If that changes, attribution
   was altered — restore it rather than reformatting around it.
 - **License:** GPLv2 (`GPL-2.0-only` in packaging, which matches the header)
-- **Lines:** ~1,180 in a single file (`oh_brother.py`)
+- **Lines:** ~1,230 in a single file (`oh_brother.py`)
 - **Version:** `0.4.0`, read at runtime via `importlib.metadata` (never a
   duplicated literal) with a `0.0.0+source` fallback when run uninstalled
 - **Installed as** the `oh-brother` console script via `pyproject.toml`
@@ -89,7 +89,8 @@ guessed interval.
 | `_validate_firmware_url(url)` | `(is_valid, error)` — scheme, domain *labels*, extension |
 | `_verify_firmware_integrity(filepath, content_length=None)` | Content-Length match + 100KB minimum |
 | `_tcp_upload(filename, ip, sock)` | TCP 9100 upload, offset-tracked sendfile retry → tri-state |
-| `_firmware_backup_path(model, version, filename)` | Where a verified image is retained |
+| `_backup_root()` | Resolves the retained-image root: the OH_BROTHER_BACKUP_DIR environment variable, or the current working directory |
+| `_firmware_backup_path(model, version, filename)` | Where a verified image is retained (absolute under the resolved root) |
 | `_remove_quietly(path)` | Delete, ignoring failure (never fails the primary operation) |
 | `_retained_message(path)` | "the image is still at …" |
 | `_incomplete_message(path)` | `TRANSFER INCOMPLETE — DO NOT POWER OFF; reflash from …` |
@@ -113,12 +114,13 @@ guessed interval.
 | `SnmpError(Exception)` | Carries `exit_code`, so the caller learns *why* rather than getting a traceback |
 | `prompt(msg)` | `input()` only when stdin is a TTY — and nothing in the flash path depends on that no-op any more |
 
-**Module constants (30):** `BROTHER_API_URL`, `BROTHER_SNMP_OID`,
+**Module constants (31):** `BROTHER_API_URL`, `BROTHER_SNMP_OID`,
 `FW_VERSION_SENTINEL`, the `EXIT_*` codes, `UPLOAD_OK`/`UPLOAD_FAILED`/
 `UPLOAD_INCOMPLETE`, `UPLOAD_SOCKET_TIMEOUT`, `UPLOAD_STALL_DEADLINE`,
 `FTP_TIMEOUT`, `SNMP_TIMEOUT`/`SNMP_RETRIES`/`SNMP_DEADLINE`,
 `FLASH_VERIFY_TIMEOUT`/`FLASH_VERIFY_POLL`, `BACKUP_DIRNAME`,
-`DOWNLOAD_CHUNK`/`DOWNLOAD_HARD_CAP`, `READY_TIMEOUT`/`READY_POLL`, plus the
+`BACKUP_DIR_ENV`, `DOWNLOAD_CHUNK`/`DOWNLOAD_HARD_CAP`,
+`READY_TIMEOUT`/`READY_POLL`, plus the
 `reqInfo` XML template. Every timeout is a named constant with the arithmetic
 written out in a comment — do not inline a duration.
 
@@ -150,8 +152,11 @@ Module is import-safe: `if __name__ == '__main__':` guard.
 - **XML parsing** — stdlib `xml.etree.ElementTree`
 - **Do not "fix" `SELIALNO`** in the XML template. That misspelling is the
   vendor's and must stay exactly as written.
-- **Downloads** land as `<name>.part` in CWD, then are `os.replace()`d into
-  `firmware_backups/<MODEL>/<version>/` (also CWD) after the integrity check
+- **Downloads** land as a unique `mkstemp` partial *inside* the resolved
+  backup directory, then are `os.replace()`d to the real firmware name in
+  `firmware_backups/<MODEL>/<version>/` after the integrity check. The root is
+  OH_BROTHER_BACKUP_DIR when set, else CWD; the directory is created once
+  before the download, and a failed promote keeps the partial
 - **Test imports** use `importlib.util.spec_from_file_location` (loaded by file
   path; the module is `oh_brother.py`)
 
@@ -167,7 +172,9 @@ Module is import-safe: `if __name__ == '__main__':` guard.
 | FTP timeout | `FTP_TIMEOUT` (30s) | `storbinary` blocking forever. A failing `QUIT` is also caught separately so it cannot discard a completed `STOR` |
 | SNMP budget | `SNMP_TIMEOUT`/`SNMP_RETRIES`/`SNMP_DEADLINE` | A three-minute hang on the commonest failure (printer off). The transport's `retries` default was being inherited silently |
 | Readiness poll | `_wait_for_printer_ready()` | The printer-reboot race between categories. Replaced a fixed `time.sleep(30)`, which was wrong in both directions |
-| Image retention | `_firmware_backup_path()`, `_retained_message()` | Losing the only copy of an image needed to retry. Nothing is ever left under a real firmware name, and the image is deleted only after a verified flash |
+| Image retention | `_backup_root()`, `_firmware_backup_path()`, `_retained_message()` | Losing the only copy of an image needed to retry. Nothing is ever left under a real firmware name, the image is deleted only after a verified flash, and a failed promote keeps the partial rather than deleting it |
+| Unique partial name | `tempfile.mkstemp()` in the backup directory | Two concurrent runs colliding on a predictable `<name>.part` and clobbering each other's in-flight download |
+| Early backup check | `os.makedirs()` before the `urlopen` | Spending ~15 MB before discovering an unwritable backup root. Returns `EXIT_DOWNLOAD` with the resolved path |
 | Post-flash verification | `_verify_flash()` | Trusting "the socket did not raise". TCP 9100 is fire-and-forget — a completed write is not an accepted image |
 
 ## CLI reference
@@ -262,7 +269,7 @@ error" when the tool returns structured exit codes.
 
 ## Testing
 
-**130 tests, 23 classes.** Run: `python3 -m pytest tests/ -q`
+**137 tests, 24 classes.** Run: `python3 -m pytest tests/ -q`
 
 | Class | Tests | What it covers |
 |---|---|---|
@@ -285,6 +292,7 @@ error" when the tool returns structured exit codes.
 | `TestPrinterUnreachable` | 3 | R15: unresolvable/refusing printer is exit 4, not exit 1 |
 | `TestInterruptHandling` | 3 | R19: Ctrl-C mid-upload (7, image retained), mid-verify (8), elsewhere (130) |
 | `TestBoundedDownload` | 3 | R10: body past Content-Length aborts at the first chunk, hard cap with no header, honest download unaffected |
+| `TestBackupRootAndPartial` | 7 | P5: env-var backup root with CWD fallback, unusable root fails before `urlopen`, unique partial name leaves a stale `.part` alone, failed promote keeps the verified image, a download that never starts leaves no partial behind |
 | `TestBetaGate` | 3 | R13: `--beta` needs `--yes`; `--yes` and `--test` pass the gate |
 | `TestFailureTraceback` | 3 | R17: traceback kept, one frame by default, full chain under `--verbose` |
 | `TestFtpUploadOutcome` | 1 | R9: a failed `QUIT` must not discard a completed `STOR` |

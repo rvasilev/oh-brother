@@ -89,7 +89,9 @@ Currently the script does the following:
     * Download the firmware from Brother, verifying its size against the
       declared `Content-Length`.
     * Retain the downloaded image under
-      `firmware_backups/<MODEL>/<version>/` as a recovery copy.
+      `firmware_backups/<MODEL>/<version>/` as a recovery copy. Set the
+      `OH_BROTHER_BACKUP_DIR` environment variable to keep that tree under a
+      different root; unset, it is the working directory.
     * Ask the user whether to proceed with updating (or, with `--yes`, proceed).
     * Upload the firmware to the printer via either TCP port 9100
       (passwordless) or FTP (with admin password).
@@ -194,7 +196,8 @@ oh-brother --test --reflash <printer IP>
 
 That is the safe way to obtain a local backup of the firmware your printer is
 currently running. The image is left at
-`firmware_backups/<MODEL>/<version>/<firmware file>`.
+`firmware_backups/<MODEL>/<version>/<firmware file>`, relative to the working
+directory unless `OH_BROTHER_BACKUP_DIR` is set.
 
 ## Re-apply the current version
 

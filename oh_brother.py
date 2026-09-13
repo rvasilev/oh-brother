@@ -32,6 +32,7 @@ import ssl
 import os
 import time
 import traceback
+import tempfile
 from ftplib import FTP, all_errors
 from urllib.parse import urlparse
 
@@ -117,8 +118,12 @@ SNMP_DEADLINE = 30
 FLASH_VERIFY_TIMEOUT = 300
 FLASH_VERIFY_POLL = 5
 
-# Local recovery-image directory.
+# Local recovery-image directory. BACKUP_DIR_ENV relocates the root under
+# which BACKUP_DIRNAME is created. It is an environment variable rather than a
+# CLI flag so the command-line surface stays frozen; unset means the current
+# working directory, which is the historical default.
 BACKUP_DIRNAME = 'firmware_backups'
+BACKUP_DIR_ENV = 'OH_BROTHER_BACKUP_DIR'
 
 # Download bounds. The largest image observed for this model is ~15 MB
 # (encrypted D02 firmware), so the hard cap is generous headroom rather than a
@@ -433,19 +438,29 @@ def _remove_quietly(path):
         pass
 
 
+def _backup_root():
+    """Root under which retained images are stored.
+
+    OH_BROTHER_BACKUP_DIR (BACKUP_DIR_ENV) relocates the root; unset means the
+    current working directory, which preserves the historical layout.
+    """
+    return os.environ.get(BACKUP_DIR_ENV) or os.getcwd()
+
+
 def _firmware_backup_path(model_name, version, filename):
     """Build the retained recovery path for a downloaded firmware image.
 
-    Layout: firmware_backups/<MODEL>/<version>/<filename>. Components are
-    sanitized so hostile model/version strings cannot escape the directory.
+    Layout: <root>/firmware_backups/<MODEL>/<version>/<filename>, where <root>
+    is _backup_root(). Components are sanitized so hostile model/version
+    strings cannot escape the directory.
     """
     def _sanitize(part):
         cleaned = re.sub(r'[^A-Za-z0-9._-]+', '_', str(part or 'unknown'))
         return cleaned.strip('._') or 'unknown'
 
     return os.path.join(
-        BACKUP_DIRNAME, _sanitize(model_name), _sanitize(version),
-        os.path.basename(filename),
+        _backup_root(), BACKUP_DIRNAME, _sanitize(model_name),
+        _sanitize(version), os.path.basename(filename),
     )
 
 
@@ -744,11 +759,38 @@ def update_firmware(cat, version):
     print('Re-run with --yes for unattended use, or from an interactive terminal.')
     return EXIT_REFUSED
 
+  # Resolve the retained-image location and make it usable ONCE, before the
+  # ~15 MB download. Discovering an unwritable backup root after the transfer
+  # would waste the whole download and report it as an opaque failure.
+  backup_path = _firmware_backup_path(model, artifact_version or version, filename)
+  backup_dir = os.path.dirname(backup_path)
+  try:
+    os.makedirs(backup_dir, exist_ok=True)
+  except OSError as e:
+    print('Error: could not create the firmware backup directory: %s' % backup_dir)
+    print(e)
+    return EXIT_DOWNLOAD
+
   # Download firmware
   print('Downloading firmware file %s from vendor server...' % filename)
   sys.stdout.flush()
 
-  part_filename = filename + '.part'
+  # A per-invocation partial name inside the backup directory: concurrent runs
+  # cannot collide on it, it is never visible under a real firmware name, and
+  # the promote() below stays a same-filesystem rename.
+  try:
+    fd, part_filename = tempfile.mkstemp(
+        prefix='.' + filename + '.', suffix='.part', dir=backup_dir)
+    os.close(fd)
+    # Release the placeholder immediately: the name is what we needed. Creating
+    # the file here would leave a zero-byte partial behind whenever urlopen
+    # fails (printer offline, CDN 404), and would also hand the retained image
+    # mkstemp's 0600 instead of the umask default. open() below creates it.
+    os.remove(part_filename)
+  except OSError as e:
+    print('Error: could not create a temporary download file in %s: %s'
+          % (backup_dir, e))
+    return EXIT_DOWNLOAD
 
   try:
     req = urllib.request.Request(firmwareURL)
@@ -810,14 +852,14 @@ def update_firmware(cat, version):
     _remove_quietly(part_filename)
     return EXIT_DOWNLOAD
 
-  # Promote the verified image into its retained recovery location.
-  backup_path = _firmware_backup_path(model, artifact_version or version, filename)
+  # Promote the verified image into its retained recovery location. The file
+  # was downloaded inside that directory, so this is normally a same-filesystem
+  # rename; if it still fails, keep the verified image rather than deleting it.
   try:
-    os.makedirs(os.path.dirname(backup_path), exist_ok=True)
     os.replace(part_filename, backup_path)
   except OSError as e:
     print('Error: could not store firmware backup: %s' % e)
-    _remove_quietly(part_filename)
+    print('The verified image is still at: %s' % os.path.abspath(part_filename))
     return EXIT_DOWNLOAD
   filename = backup_path
 

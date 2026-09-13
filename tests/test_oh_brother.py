@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import sys
+import urllib.error
 import xml.etree.ElementTree as ET
 import pytest
 
@@ -2168,3 +2169,155 @@ class TestAsciiOutputPortability:
         assert code != oh.EXIT_ERROR
         assert "POWER OFF" in out
         assert "Traceback" not in out
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 follow-up (P5): backup root, unique partial name, early check
+# ---------------------------------------------------------------------------
+
+class TestBackupRootAndPartial:
+    """P5: the retained-image root is configurable, the partial name is unique,
+    and an unusable location is discovered before a single byte is downloaded.
+
+    ``OH_BROTHER_BACKUP_DIR`` is referenced as a literal here rather than via
+    ``oh.BACKUP_DIR_ENV`` so a pre-fix run exercises the real download path
+    instead of dying with an AttributeError on a symbol the fix introduces.
+    """
+
+    def _arm(self, monkeypatch):
+        oh.args = _args(test=True)
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+
+    def test_unusable_backup_dir_fails_before_download(
+            self, monkeypatch, tmp_path, capsys):
+        """A backup root that cannot be created must cost no bandwidth."""
+        self._arm(monkeypatch)
+        blocker = tmp_path / "blocked"
+        blocker.write_text("not a directory")
+        monkeypatch.setenv("OH_BROTHER_BACKUP_DIR", str(blocker))
+        monkeypatch.chdir(tmp_path)
+
+        downloads = []
+
+        def no_download(*a, **k):
+            downloads.append(1)
+            raise AssertionError("urlopen must not be called")
+
+        monkeypatch.setattr(oh.urllib.request, "urlopen", no_download)
+
+        sockets = []
+        monkeypatch.setattr(oh.socket, "socket",
+                            lambda *a, **k: sockets.append(1))
+        monkeypatch.setattr(oh.socket, "getaddrinfo",
+                            lambda *a, **k: sockets.append(1))
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_DOWNLOAD
+        assert downloads == []
+        assert sockets == []
+        assert "blocked" in out
+
+    def test_backup_root_is_honoured(self, monkeypatch, tmp_path):
+        """With the env var set the image lands under it, not under CWD."""
+        self._arm(monkeypatch)
+        root = tmp_path / "data"
+        root.mkdir()
+        cwd = tmp_path / "run"
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        monkeypatch.setenv("OH_BROTHER_BACKUP_DIR", str(root))
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_OK
+
+        retained = list((root / oh.BACKUP_DIRNAME).rglob("*.djf"))
+        assert len(retained) == 1
+        assert retained[0].stat().st_size == 204800
+        assert not list(cwd.rglob("*.djf"))
+        assert not list(cwd.rglob("*.part"))
+
+    def test_backup_root_defaults_to_cwd(self, monkeypatch, tmp_path):
+        """Unset, the root is the CWD, exactly as before the change."""
+        self._arm(monkeypatch)
+        monkeypatch.delenv("OH_BROTHER_BACKUP_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_OK
+        retained = list((tmp_path / oh.BACKUP_DIRNAME).rglob("*.djf"))
+        assert len(retained) == 1
+        assert retained[0].stat().st_size == 204800
+
+    def test_unique_partial_name_leaves_a_stale_partial_alone(
+            self, monkeypatch, tmp_path):
+        """A leftover <name>.part from an earlier run is never touched."""
+        self._arm(monkeypatch)
+        monkeypatch.delenv("OH_BROTHER_BACKUP_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+
+        stale = tmp_path / "D02FZM_124Q_crypt.djf.part"
+        stale.write_bytes(b"stale in-flight bytes")
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_OK
+
+        assert stale.exists()
+        assert stale.read_bytes() == b"stale in-flight bytes"
+        assert list(tmp_path.rglob("*.part")) == [stale]
+
+    def test_promotion_failure_keeps_the_verified_image(
+            self, monkeypatch, tmp_path, capsys):
+        """A failed promote must not delete the only verified copy."""
+        self._arm(monkeypatch)
+        monkeypatch.delenv("OH_BROTHER_BACKUP_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+
+        def refuse_replace(src, dst):
+            raise OSError(18, "Invalid cross-device link")
+
+        monkeypatch.setattr(oh.os, "replace", refuse_replace)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_DOWNLOAD
+        assert "Invalid cross-device link" in out
+        parts = list(tmp_path.rglob("*.part"))
+        assert len(parts) == 1
+        assert parts[0].stat().st_size == 204800
+
+    @pytest.mark.parametrize("exc", [
+        urllib.error.URLError("network down"),
+        urllib.error.HTTPError("http://x/y.djf", 404, "Not Found", None, None),
+    ])
+    def test_download_that_never_starts_leaves_nothing_behind(
+            self, monkeypatch, tmp_path, exc):
+        """A urlopen failure must not leave a partial in the backup directory.
+
+        Regression: the partial name was reserved with mkstemp *before* the
+        request, so the printer-offline (URLError) and CDN-404 (HTTPError) paths
+        each left a zero-byte hidden ``.<name>.<rand>.part`` behind. The name is
+        reserved and released; the file is created by open() only once the
+        response is in hand.
+        """
+        self._arm(monkeypatch)
+        monkeypatch.delenv("OH_BROTHER_BACKUP_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        def boom(*a, **k):
+            raise exc
+
+        monkeypatch.setattr(oh.urllib.request, "urlopen", boom)
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_DOWNLOAD
+        assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
