@@ -2,7 +2,7 @@
 
 **Source of truth:** `docs/audit-optimization-portability-2026-09-13.md`
 **Quality net:** `docs/audit-adoption-aislop-2026-09-13.md` + `.aislop/config.yml`
-**Repo:** `~/Documents/Projects/oh-brother`, branch `harden` @ `9a2f7e5` (treat the branch as disposable — work stays local until reviewed)
+**Repo:** `~/Documents/Projects/oh-brother`, branch `harden` @ `c8c85ed` (treat the branch as disposable — work stays local until reviewed)
 **Instruction to the agent:** this is a GPLv2 fork. Preserve behaviour, preserve the licence header, and make no change that is not in the packet you were given.
 
 ---
@@ -13,7 +13,8 @@
 |---|---|---|
 | 1 — P1 non-ASCII / exit-code laundering | **Done, committed `4b4c054`** | 130 tests pass in 0.19s; drift checker `No drift`; GPL header md5 unchanged (`37f53a…eb07`); RED reproduced independently in a throwaway copy with the original source restored — `assert 1 == 7` with the upload window genuinely reached; live smoke test against HL-L2865DW clean (0 non-ASCII bytes, no traceback, image retained at md5 `c5306355c75a95fa6c04109c1d7f70b0`), and an `LC_ALL=C PYTHONIOENCODING=ascii` run returns 3 with no raise. Files: `oh_brother.py`, `tests/test_oh_brother.py`, `AGENTS.md`. |
 | 2 — P5 download safety | **Done, committed `815aa51`** | Delivered by Crush, then independently verified: the packet's 5 tests re-derived RED against the pre-packet-2 source (4 failed, 1 passed — stale partial consumed; verified image deleted on promote failure); 137 tests pass; drift checker `No drift`; header md5 unchanged. **Verification found one defect in the packet and it was fixed rather than shipped:** `mkstemp` created the placeholder before the request, so `URLError` (printer off) and `HTTPError` (CDN 404) each left a zero-byte hidden `.<name>.<rand>.part` in the backup directory, and the retained image inherited `0600` instead of the umask default. The name is reserved and released instead; `test_download_that_never_starts_leaves_nothing_behind` covers both and is RED against the as-delivered source. Live `--test --reflash` returns 0 with the image retained under the configured root, an empty CWD, and md5 `c5306355c75a95fa6c04109c1d7f70b0`, both with the env var set and with the CWD fallback. |
-| 3 — P4 idempotent fetch | Not started | |
+| 3A — P4 integrity: sha256 sidecar, retained-copy state, change detection | **Dispatched** — handoff `docs/handoff-packet-3a-2026-09-13.md` | Split from Packet 3 because the two halves are one-way dependent (3B consumes the state 3A records) and because 3A must NOT skip the download. Scope: `SHA256_SUFFIX` + `_sha256_file` + `_sidecar_path` + `_retained_copy_state` (absent/verified/unrecorded/corrupt), sidecar written atomically at retention, `sha256sum -c` interoperability, identical-bytes promote skipped, changed-artifact notice naming both digests. |
+| 3B — P4 bandwidth: conditional GET reuse | Not started — blocked on 3A | `If-None-Match`/`If-Modified-Since` from a persisted vendor validator; `304` ⇒ reuse and log the decision loudly; `200` ⇒ download as today. Needs a realised risk resolved first: the CDN's `ETag` prefix is the artifact's **md5**, while 3A records **sha256**, so the validator must be persisted separately rather than derived (`<name>.etag`, or equivalent) — the block is the storage, not the request. |
 | 4 — P6/P7 stream guards + bounded walk | Not started | |
 | 5 — P8 hygiene | Not started | |
 | P2/P3 — signals, deployment contract | Human-only, gated on G1/G4 | |
@@ -95,12 +96,31 @@ or "fix" the deliberate `except OSError: pass` in `_remove_quietly`.
 
 ## Packet 3 — P4: stop overwriting the retained image; make the fetch stay honest
 
-Two independent parts; land them separately.
-- `sha256` sidecar written at retention time; before promoting, compare. Missing/mismatched sidecar ⇒ download, never trust.
-  **A size-only or exists-only reuse check is a gate weakening and must not ship.**
-- Conditional GET (`If-None-Match` / `If-Modified-Since`) using the retained file's hash/mtime; `304` ⇒ reuse and log the
-  decision loudly; `200` ⇒ download as today. Verified live: the CDN returns `304` with an ETag whose prefix is the md5.
-- RED test first: an existing file with a **wrong** recorded hash must trigger a re-download.
+**Split into 3A and 3B** (handoffs: `handoff-packet-3a-2026-09-13.md`, `handoff-packet-3b-…`). The plan said
+"land them separately"; the split is one-way dependent, so 3A is the only one that can go first.
+
+**A correction found while writing the handoff, which reorders the two halves' importance.** A recorded digest
+can prove the retained file is bit-for-bit the one that was verified, and can surface a changed vendor
+artifact. It **cannot detect a corrupt download**, because the vendor supplies no expected digest — only the
+declared `Content-Length`. So the sidecar's value is that it makes reuse safe to *consider*, and 3B is what
+actually makes reuse *sound*, by corroborating with the vendor. The audit called the sidecar the
+safety-relevant half; on this reading it is the enabling half, and neither ships alone.
+
+**3A — integrity and change detection (no download skipping).** `sha256` sidecar written atomically at
+retention time in `sha256sum` format; `_retained_copy_state()` classifying the retained copy as
+`absent`/`verified`/`unrecorded`/`corrupt` (a malformed sidecar is `unrecorded`, never `corrupt`); identical
+bytes ⇒ skip the pointless 15 MB rewrite; changed bytes ⇒ an unmissable notice naming **both** digests, then
+promote as today. A missing sidecar is fail-open (re-download and re-verify) and never costs the image.
+**3A must not skip a download on any path** — a reuse branch here would be exactly the gate weakening gate G2
+forbids, with no vendor corroboration behind it. RED test first: an existing file whose **wrong** recorded
+hash must still cause a real re-download.
+
+**3B — conditional GET.** `If-None-Match`/`If-Modified-Since` from the retained file's recorded validator;
+`304` ⇒ reuse and log the decision loudly; `200` ⇒ download as today. Verified live: the CDN returns `304`
+with an `ETag` whose prefix is the md5 — but our sidecar records **sha256**, so the validator cannot be
+derived from it and must be persisted as its own small file (the CDN's `ETag`, or `Last-Modified` when no
+`ETag` is sent). That storage decision is the real work in 3B; the request itself is three lines. No validator
+stored ⇒ no conditional request ⇒ today's behaviour. Reuse is permitted only when 3A says `verified`.
 
 ## Packet 4 — P6 + P7: stream guards and the one unbounded walk
 
