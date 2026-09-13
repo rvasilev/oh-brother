@@ -102,6 +102,9 @@ UPLOAD_SOCKET_TIMEOUT = 300       # bounds one sendfile() call
 UPLOAD_STALL_DEADLINE = 3600      # bounds the whole transfer
 FTP_TIMEOUT = 30                  # bounds a hung FTP session
 
+# HTTP client timeout (seconds) for the vendor API and the firmware download.
+HTTP_TIMEOUT = 30
+
 # SNMP discovery budget (seconds).
 #
 # pysnmp's transport defaults to timeout=1, retries=5, and the walk inherits
@@ -135,6 +138,10 @@ VALIDATOR_SUFFIX = '.validator'
 # disk fills, and a truncated artifact is not distinguishable by name alone.
 DOWNLOAD_CHUNK = 102400                 # bytes per read()
 DOWNLOAD_HARD_CAP = 64 * 1024 * 1024    # 64 MB
+
+# Smallest plausible Brother firmware image. Anything smaller is an error
+# page or a truncated transfer, not a firmware blob.
+MIN_FIRMWARE_SIZE = 102400              # 100KB — no real Brother firmware is smaller
 
 # Readiness window used between firmware categories (seconds). A Brother laser
 # reboots after a flash and needs 60-120s+ to come back, so this is polled
@@ -235,7 +242,7 @@ def parse_brother_response(xml_bytes):
 def _version():
     try:
         return _dist_version("oh-brother")
-    except PackageNotFoundError:
+    except (PackageNotFoundError, ImportError):
         return "0.0.0+source"
 
 # Parse args
@@ -350,15 +357,16 @@ def _version_tuple(version_str):
         return None
 
 
-_ARTIFACT_VERSION_RE = re.compile(r'_(\d{3})([A-Za-z])')
+_ARTIFACT_VERSION_RE = re.compile(r'_(\d{2,4})([A-Za-z])')
 
 
 def _parse_artifact_version(filename):
     """Extract a firmware version from an artifact filename.
 
-    Brother filenames encode the version as three digits followed by a
-    letter, e.g. D02FZM_124Q_crypt.djf -> '1.24'. Letter-only names such
-    as D00KJY_F or LZ2751_L do not match.
+    Brother filenames encode the version as two to four digits followed by a
+    letter, e.g. D02FZM_124Q_crypt.djf -> '1.24'. Letter-only names such as
+    D00KJY_F or LZ2751_L do not match, and a single digit (V_1Q) is not a
+    Brother version encoding, so it stays unparsed rather than guessed at.
 
     Returns: version string like '1.24', or None when unparseable.
     """
@@ -394,7 +402,7 @@ def _validate_firmware_url(url):
     return True, None
 
 
-def _tcp_upload(filename, ip, sock):
+def _tcp_upload(filename, sock):
     """Upload firmware file to printer via TCP port 9100 with retry.
 
     Uses sendfile with offset tracking for short-write resilience. The socket
@@ -440,8 +448,6 @@ def _verify_firmware_integrity(filepath, content_length=None):
     Checks: minimum size (100KB), Content-Length match if provided.
     Returns: (is_valid: bool, error_message: str or None)
     """
-    MIN_FIRMWARE_SIZE = 102400  # 100KB — no real Brother firmware is smaller
-    
     try:
         actual_size = os.path.getsize(filepath)
     except OSError as e:
@@ -705,7 +711,7 @@ def _query_printer_version(ip, community, cat):
         table = asyncio.run(asyncio.wait_for(
             _snmp_walk_table(ip, community, BROTHER_SNMP_OID), SNMP_DEADLINE,
         ))
-    except (Exception, SystemExit):
+    except Exception:
         return None
     info = parse_snmp_table(table)
     for fw in info['firmwares']:
@@ -785,7 +791,7 @@ def _wait_for_printer_ready(ip, community, timeout=None, poll=None):
         time.sleep(poll)
 
 
-def _http_post(url, data, hdrs, timeout=30):
+def _http_post(url, data, hdrs, timeout=HTTP_TIMEOUT):
     """POST data to a URL with comprehensive error handling.
     
     Returns: (response_bytes, None) on success, (None, error_message) on failure.
@@ -794,7 +800,7 @@ def _http_post(url, data, hdrs, timeout=30):
     return _http_request(url, data, hdrs, timeout=timeout)
 
 
-def _http_request(url, data=None, hdrs=None, timeout=30):
+def _http_request(url, data=None, hdrs=None, timeout=HTTP_TIMEOUT):
     """HTTP request (POST if data provided, GET otherwise) with error handling.
     
     Returns: (response_bytes, None) on success, (None, error_message) on failure.
@@ -816,9 +822,9 @@ def _http_request(url, data=None, hdrs=None, timeout=30):
             return None, (
                 "SSL certificate verification failed -- your Python install "
                 "may be missing CA certificates.\n"
-                "  macOS: run /Applications/Python*/Install Certificates.command\n"
-                "  Linux: install ca-certificates package\n"
-                "  Or: pip install certifi"
+                "  Linux: install your distribution's ca-certificates package\n"
+                "  macOS: run Install Certificates.command in your Python installation\n"
+                "  FreeBSD: install ca_root_nss, or set SSL_CERT_FILE to a CA bundle path"
             )
         if isinstance(reason, socket.timeout):
             return None, (
@@ -908,21 +914,20 @@ def update_firmware(cat, version):
     if not getattr(args, 'reflash', False):
       # R1: already current is terminal unless --reflash was given.
       return EXIT_CURRENT
-    firmwareURL = _try_version_fallback(version, cat, url, hdrs)
-    if firmwareURL:
-      print('Found firmware URL via version fallback')
-    else:
-      return EXIT_VENDOR
+    use_fallback = True
   elif result['firmware_url'] is None:
     print('No firmware update info path found '
           '(newer Brother models require version fallback)')
+    use_fallback = True
+  else:
+    use_fallback = False
+    firmwareURL = result['firmware_url']
+  if use_fallback:
     firmwareURL = _try_version_fallback(version, cat, url, hdrs)
     if firmwareURL:
       print('Found firmware URL via version fallback')
     else:
       return EXIT_VENDOR
-  else:
-    firmwareURL = result['firmware_url']
 
   # Validate firmware URL before downloading
   valid, err = _validate_firmware_url(firmwareURL)
@@ -1036,7 +1041,7 @@ def update_firmware(cat, version):
   while True:
     try:
       req = urllib.request.Request(firmwareURL, headers=conditional)
-      response = urllib.request.urlopen(req, timeout=30)
+      response = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
     except urllib.error.HTTPError as e:
       # urllib raises HTTPError for a 304 rather than returning a response, so a
       # successful reuse arrives here. Handle it before the generic path below,
@@ -1227,7 +1232,7 @@ def update_firmware(cat, version):
       # failure rather than a connectivity problem.
       try:
         with sock:
-          upload_result = _tcp_upload(filename, args.ip, sock)
+          upload_result = _tcp_upload(filename, sock)
       # aislop-ignore-next-line ai-slop/swallowed-exception -- the handler reports the failure; the post-upload version check is authoritative.
       except OSError as e:
         print('Firmware update aborted due to error while uploading')

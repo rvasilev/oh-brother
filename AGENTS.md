@@ -121,13 +121,13 @@ guessed interval.
 | `SnmpError(Exception)` | Carries `exit_code`, so the caller learns *why* rather than getting a traceback |
 | `prompt(msg)` | `input()` only when stdin is a TTY — and nothing in the flash path depends on that no-op any more |
 
-**Module constants (34):** `BROTHER_API_URL`, `BROTHER_SNMP_OID`,
+**Module constants (36):** `BROTHER_API_URL`, `BROTHER_SNMP_OID`,
 `FW_VERSION_SENTINEL`, the `EXIT_*` codes, `UPLOAD_OK`/`UPLOAD_FAILED`/
 `UPLOAD_INCOMPLETE`, `UPLOAD_SOCKET_TIMEOUT`, `UPLOAD_STALL_DEADLINE`,
-`FTP_TIMEOUT`, `SNMP_TIMEOUT`/`SNMP_RETRIES`/`SNMP_DEADLINE`,
+`FTP_TIMEOUT`, `HTTP_TIMEOUT`, `SNMP_TIMEOUT`/`SNMP_RETRIES`/`SNMP_DEADLINE`,
 `FLASH_VERIFY_TIMEOUT`/`FLASH_VERIFY_POLL`, `BACKUP_DIRNAME`,
 `BACKUP_DIR_ENV`, `SHA256_SUFFIX`, `VALIDATOR_SUFFIX`,
-`DOWNLOAD_CHUNK`/`DOWNLOAD_HARD_CAP`,
+`DOWNLOAD_CHUNK`/`DOWNLOAD_HARD_CAP`, `MIN_FIRMWARE_SIZE`,
 `READY_TIMEOUT`/`READY_POLL`, plus the
 `reqInfo` XML template. Every timeout is a named constant with the arithmetic
 written out in a comment — do not inline a duration.
@@ -278,12 +278,12 @@ error" when the tool returns structured exit codes.
 
 ## Testing
 
-**171 tests, 30 classes.** Run: `python3 -m pytest tests/ -q`
+**174 tests, 30 classes.** Run: `python3 -m pytest tests/ -q`
 
 | Class | Tests | What it covers |
 |---|---|---|
-| `TestCLI` | 19 (parameterized) | All boolean flags, string args, category+version combo, IP required, `--reflash` |
-| `TestSafetyGates` | 9 | Default-deny: already-current terminal, non-TTY refusal, downgrade refusal, no-override-flag |
+| `TestCLI` | 20 (parameterized) | All boolean flags, string args, category+version combo, IP required, `--reflash`, `_version` fallback on malformed metadata |
+| `TestSafetyGates` | 10 | Default-deny: already-current terminal, non-TTY refusal, downgrade refusal, no-override-flag, 2-4 digit artifact parsing |
 | `TestValidateFirmwareUrl` | 8 | Valid HTTP/HTTPS, .upd, wrong domain, file://, wrong ext, empty, query params |
 | `TestSnmpFailureClassification` | 7 | Walk raises `SnmpError` instead of `sys.exit(1)`; off printer is exit 4, protocol error exit 1; bounded SNMP budget and deadline; rebooting printer tolerated |
 | `TestParseSnmpTable` | 7 | Real printer data, multi-FW, ordering edge cases, empty table, verbose |
@@ -297,7 +297,7 @@ error" when the tool returns structured exit codes.
 | `TestParseBrotherResponse` | 5 | Up-to-date, update available, no PATH, no VERSIONCHECK, empty response |
 | `TestHttpPost` | 5 | Success, HTTP 503, SSL cert error, timeout, DNS failure |
 | `TestForcedCategoryFlags` | 5 | R12: `-f` requires `-c`, `-c` alone keeps the SNMP installed version, unknown category refused, sentinel is not a version |
-| `TestTcpUpload` | 3 | Full sendfile, short-write retry, zero-return failure |
+| `TestTcpUpload` | 4 | Full sendfile, short-write retry, zero-return failure, no dead `ip` parameter |
 | `TestPrinterUnreachable` | 3 | R15: unresolvable/refusing printer is exit 4, not exit 1 |
 | `TestInterruptHandling` | 3 | R19: Ctrl-C mid-upload (7, image retained), mid-verify (8), elsewhere (130) |
 | `TestBoundedDownload` | 3 | R10: body past Content-Length aborts at the first chunk, hard cap with no header, honest download unaffected |

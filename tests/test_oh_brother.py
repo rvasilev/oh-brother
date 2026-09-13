@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import inspect
 import os
 import sys
 import urllib.error
@@ -272,6 +273,14 @@ class TestCLI:
     def test_parser_accessible(self):
         """Module-level parser is importable."""
         assert hasattr(oh, "parser")
+
+    def test_version_falls_back_when_metadata_is_malformed(self, monkeypatch):
+        """A broken distribution record must not make the module un-importable."""
+        def broken(_name):
+            raise ImportError("malformed metadata")
+
+        monkeypatch.setattr(oh, "_dist_version", broken)
+        assert oh._version() == "0.0.0+source"
 
 
 # ---------------------------------------------------------------------------
@@ -832,7 +841,7 @@ class TestTcpUpload:
         mock_sock = MagicMock()
         mock_sock.sendfile.return_value = 4096
 
-        result = oh._tcp_upload(str(fw_path), "1.2.3.4", mock_sock)
+        result = oh._tcp_upload(str(fw_path), mock_sock)
         assert result is True
         assert mock_sock.sendfile.call_count == 1
 
@@ -846,7 +855,7 @@ class TestTcpUpload:
         mock_sock = MagicMock()
         mock_sock.sendfile.side_effect = [4096, 4096, 0]
 
-        result = oh._tcp_upload(str(fw_path), "1.2.3.4", mock_sock)
+        result = oh._tcp_upload(str(fw_path), mock_sock)
         assert result is True
         assert mock_sock.sendfile.call_count >= 2
 
@@ -860,8 +869,12 @@ class TestTcpUpload:
         mock_sock = MagicMock()
         mock_sock.sendfile.return_value = 0
 
-        result = oh._tcp_upload(str(fw_path), "1.2.3.4", mock_sock)
+        result = oh._tcp_upload(str(fw_path), mock_sock)
         assert result is False
+
+    def test_signature_drops_the_dead_ip_parameter(self):
+        """The upload decides success/failure; it must not advertise an address."""
+        assert "ip" not in inspect.signature(oh._tcp_upload).parameters
 
 
 # ---------------------------------------------------------------------------
@@ -1142,7 +1155,7 @@ class TestSafetyGates:
                             lambda *a, **k: (XML_UPDATE_124, None))
         monkeypatch.setattr(oh.urllib.request, "urlopen",
                             lambda *a, **k: _download_response())
-        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, sock: False)
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, sock: False)
         monkeypatch.setattr(oh.socket, "getaddrinfo",
                             lambda *a, **k: [(2, 1, 6, '', ('1.2.3.4', 9100))])
         monkeypatch.setattr(oh.socket, "socket", lambda *a: MagicMock())
@@ -1223,6 +1236,13 @@ class TestSafetyGates:
         assert oh._parse_artifact_version("D00KJY_F") is None
         assert oh._parse_artifact_version("LZ2751_L") is None
 
+    def test_parse_artifact_version_accepts_two_to_four_digits(self):
+        """The downgrade gate must see 2- and 4-digit artifacts, not warn past them."""
+        assert oh._parse_artifact_version("X_12Q") == "1.2"
+        assert oh._parse_artifact_version("Y_1245Q") == "1.245"
+        # A single digit is not a Brother version encoding; keep it unparsed.
+        assert oh._parse_artifact_version("V_1Q") is None
+
 
 # ---------------------------------------------------------------------------
 # Firmware write-path hardening: retention, incomplete transfer, verification
@@ -1256,7 +1276,7 @@ class TestFlashHardening:
                             lambda *a, **k: (XML_UPDATE_124, None))
         monkeypatch.setattr(oh.urllib.request, "urlopen",
                             lambda *a, **k: _download_response())
-        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, sock: False)
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, sock: False)
         _fake_tcp_socket(monkeypatch)
         monkeypatch.chdir(tmp_path)
 
@@ -1338,7 +1358,7 @@ class TestFlashHardening:
                             lambda *a, **k: (XML_UPDATE_124, None))
         monkeypatch.setattr(oh.urllib.request, "urlopen",
                             lambda *a, **k: _download_response())
-        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, sock: True)
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, sock: True)
         monkeypatch.setattr(oh, "_query_printer_version",
                             lambda ip, community, cat: "1.24")
         _fake_tcp_socket(monkeypatch)
@@ -1362,7 +1382,7 @@ class TestFlashHardening:
                             lambda *a, **k: (XML_UPDATE_124, None))
         monkeypatch.setattr(oh.urllib.request, "urlopen",
                             lambda *a, **k: _download_response())
-        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, sock: True)
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, sock: True)
         monkeypatch.setattr(oh, "_query_printer_version",
                             lambda ip, community, cat: "1.20")
         _fake_tcp_socket(monkeypatch)
@@ -1388,7 +1408,7 @@ class TestFlashHardening:
                             lambda *a, **k: (XML_UPDATE_124, None))
         monkeypatch.setattr(oh.urllib.request, "urlopen",
                             lambda *a, **k: _download_response())
-        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, sock: True)
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, sock: True)
         monkeypatch.setattr(oh, "_query_printer_version",
                             lambda ip, community, cat: None)
         _fake_tcp_socket(monkeypatch)
@@ -1428,7 +1448,7 @@ class TestInterruptHandling:
         """Interrupted mid-transfer: loud warning, image kept, exit 7."""
         _prepare_flash(monkeypatch, tmp_path)
 
-        def interrupt(f, ip, sock):
+        def interrupt(f, sock):
             raise KeyboardInterrupt()
 
         monkeypatch.setattr(oh, "_tcp_upload", interrupt)
@@ -1448,7 +1468,7 @@ class TestInterruptHandling:
             self, monkeypatch, tmp_path, capsys):
         """Interrupted during the confirm poll: UNVERIFIED, never exit 0."""
         _prepare_flash(monkeypatch, tmp_path)
-        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, sock: True)
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, sock: True)
         _fake_tcp_socket(monkeypatch)
 
         def interrupt(*a, **k):
@@ -1527,7 +1547,7 @@ class TestPrinterUnreachable:
             self, monkeypatch, tmp_path, capsys):
         """Connectivity (4) and rejection (7) must stay distinguishable."""
         _prepare_flash(monkeypatch, tmp_path)
-        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, sock: False)
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, sock: False)
         _fake_tcp_socket(monkeypatch)
 
         result = oh.update_firmware("MAIN", "1.24")
@@ -2153,7 +2173,7 @@ class TestAsciiOutputPortability:
 
         uploads = []
 
-        def fake_upload(filename, ip, sock_obj):
+        def fake_upload(filename, sock_obj):
             uploads.append(filename)
             return oh.UPLOAD_INCOMPLETE
 
@@ -2998,7 +3018,7 @@ class TestR16Preflight:
         monkeypatch.setattr(oh.socket, "getaddrinfo",
                             lambda *a, **k: [(2, 1, 6, '', ('1.2.3.4', 9100))])
         monkeypatch.setattr(oh.socket, "socket", lambda *a: sock)
-        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, s: upload_result)
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, s: upload_result)
         monkeypatch.setattr(oh, "_verify_flash",
                             lambda *a, **k: ("ok", "1.24"))
         monkeypatch.chdir(tmp_path)
