@@ -11,8 +11,8 @@
 
 | Packet | State | Evidence (independently verified 2026-09-13) |
 |---|---|---|
-| 1 — P1 non-ASCII / exit-code laundering | **Done, uncommitted** | 130 tests pass in 0.20s; drift checker `No drift`; GPL header md5 unchanged (`37f53a…eb07`); RED reproduced independently in a throwaway copy with the original source restored — `assert 1 == 7` with the upload window genuinely reached. Files: `oh_brother.py`, `tests/test_oh_brother.py`, `AGENTS.md`. |
-| 2 — P5 download safety | Not started | |
+| 1 — P1 non-ASCII / exit-code laundering | **Done, committed `4b4c054`** | 130 tests pass in 0.19s; drift checker `No drift`; GPL header md5 unchanged (`37f53a…eb07`); RED reproduced independently in a throwaway copy with the original source restored — `assert 1 == 7` with the upload window genuinely reached; live smoke test against HL-L2865DW clean (0 non-ASCII bytes, no traceback, image retained at md5 `c5306355c75a95fa6c04109c1d7f70b0`), and an `LC_ALL=C PYTHONIOENCODING=ascii` run returns 3 with no raise. Files: `oh_brother.py`, `tests/test_oh_brother.py`, `AGENTS.md`. |
+| 2 — P5 download safety | **Planned, prompt written, not dispatched** — `docs/handoff-packet-2-2026-09-13.md` | Scope: env-var backup root with CWD fallback, unique partial filename, early directory check before the download, and a promotion path that cannot assume same-filesystem. |
 | 3 — P4 idempotent fetch | Not started | |
 | 4 — P6/P7 stream guards + bounded walk | Not started | |
 | 5 — P8 hygiene | Not started | |
