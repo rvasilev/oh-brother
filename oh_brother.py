@@ -126,6 +126,7 @@ FLASH_VERIFY_POLL = 5
 BACKUP_DIRNAME = 'firmware_backups'
 BACKUP_DIR_ENV = 'OH_BROTHER_BACKUP_DIR'
 SHA256_SUFFIX = '.sha256'
+VALIDATOR_SUFFIX = '.validator'
 
 # Download bounds. The largest image observed for this model is ~15 MB
 # (encrypted D02 firmware), so the hard cap is generous headroom rather than a
@@ -490,6 +491,11 @@ def _sidecar_path(backup_path):
     return backup_path + SHA256_SUFFIX
 
 
+def _validator_path(backup_path):
+    """Path of the vendor validator record that accompanies a retained image."""
+    return backup_path + VALIDATOR_SUFFIX
+
+
 def _write_sidecar(backup_path, digest):
     """Record a retained image's digest in sha256sum format, atomically.
 
@@ -508,6 +514,80 @@ def _write_sidecar(backup_path, digest):
     except OSError:
         _remove_quietly(tmp)
         raise
+
+
+def _write_validator(backup_path, headers):
+    """Record the vendor's validator for a retained image, atomically.
+
+    One line, verbatim from the download response: 'Last-Modified: <raw HTTP
+    date>' when the response carried one, otherwise 'ETag: <value>'. A response
+    carrying neither writes no file and removes any stale record -- the absence
+    is meaningful, meaning the vendor gave us nothing to condition on.
+
+    Last-Modified is preferred over the stronger-looking ETag because it is the
+    one this CDN acts on, measured rather than assumed. Two probes of
+    update-akamai.brother.co.jp, sending the artifact's own validator back:
+    If-None-Match returns 200 in every case (exact ETag, lowercase header name,
+    md5 prefix alone), while If-Modified-Since with the response's own
+    Last-Modified returns 304. The ETag there is real -- it is
+    "<md5 of the artifact>:<timestamp>" -- and simply ignored, so preferring it
+    would leave every run re-downloading 15 MB with no visible reason.
+
+    An ETag-only validator against a CDN that honours only Last-Modified is
+    harmless in the same way: it answers 200 and the run converges on the
+    normal download path. Sending both headers was rejected -- RFC 7232 says a
+    recipient must ignore If-Modified-Since when If-None-Match is present, so
+    the pair only works against a server that ignores the ETag anyway.
+
+    Raises OSError when the record cannot be written; the caller decides what
+    that means.
+    """
+    last_modified = headers.get('Last-Modified')
+    if last_modified is not None:
+        name, value = 'Last-Modified', last_modified
+    else:
+        etag = headers.get('ETag')
+        if etag is None:
+            _remove_quietly(_validator_path(backup_path))
+            return
+        name, value = 'ETag', etag
+    validator = _validator_path(backup_path)
+    tmp = validator + '.tmp'
+    try:
+        with open(tmp, 'w') as f:
+            f.write('%s: %s\n' % (name, value))
+        os.replace(tmp, validator)
+    except OSError:
+        _remove_quietly(tmp)
+        raise
+
+
+def _conditional_headers(backup_path):
+    """Build conditional-request headers from a retained image's validator.
+
+    Returns {} unless the validator file exists, parses as exactly one
+    '<Header-Name>: <value>' line, and names ETag or Last-Modified. An ETag
+    becomes If-None-Match; a Last-Modified becomes If-Modified-Since. Anything
+    unrecognised yields no conditional header, so the fetch falls back to a
+    full unconditional download.
+    """
+    try:
+        with open(_validator_path(backup_path), 'r') as f:
+            line = f.readline().rstrip('\n')
+    except OSError:
+        return {}
+    if ': ' not in line:
+        return {}
+    name, value = line.split(': ', 1)
+    name = name.strip().lower()
+    value = value.strip()
+    if not value:
+        return {}
+    if name == 'etag':
+        return {'If-None-Match': value}
+    if name == 'last-modified':
+        return {'If-Modified-Since': value}
+    return {}
 
 
 def _retained_copy_state(backup_path):
@@ -889,117 +969,160 @@ def update_firmware(cat, version):
           % (backup_dir, e))
     return EXIT_DOWNLOAD
 
-  try:
-    req = urllib.request.Request(firmwareURL)
-    response = urllib.request.urlopen(req, timeout=30)
-  except urllib.error.HTTPError as e:
-    print('Error: HTTP %d (%s) from Brother CDN -- try again later.' % (e.code, e.reason))
-    return EXIT_DOWNLOAD
-  except urllib.error.URLError as e:
-    print('Error: download failed: %s' % e.reason)
-    return EXIT_DOWNLOAD
+  # Reuse is only considered when 3A judged the retained copy 'verified' AND
+  # the vendor gave us a validator to condition on. The validator is the
+  # vendor's confirmation that those bytes are still current; a digest alone is
+  # never that confirmation.
+  conditional = {}
+  if retained_state == 'verified':
+    conditional = _conditional_headers(backup_path)
 
-  content_length = response.headers.get('Content-Length')
-  declared = None
-  if content_length is not None:
+  while True:
     try:
-      declared = int(content_length)
-    except (TypeError, ValueError):
-      declared = None
-
-  written = 0
-  try:
-    with open(part_filename, 'wb') as f:
-      while True:
-        block = response.read(DOWNLOAD_CHUNK)
-        if not block: break
-        f.write(block)
-        written += len(block)
-        # R10: bound the loop. Without this a broken or hostile source writes
-        # until the disk fills, and a truncated artifact cannot be told from a
-        # complete one by its name.
-        if written > DOWNLOAD_HARD_CAP:
-          print()
-          print('Error: firmware download exceeded the %d MB safety cap '
-                '(%d bytes received) -- aborting.'
-                % (DOWNLOAD_HARD_CAP // (1024 * 1024), written))
+      req = urllib.request.Request(firmwareURL, headers=conditional)
+      response = urllib.request.urlopen(req, timeout=30)
+    except urllib.error.HTTPError as e:
+      # urllib raises HTTPError for a 304 rather than returning a response, so a
+      # successful reuse arrives here. Handle it before the generic path below,
+      # which would otherwise report it as a download failure.
+      if e.code == 304 and conditional:
+        reuse_state, reuse_digest = _retained_copy_state(backup_path)
+        if reuse_state == 'verified':
           _remove_quietly(part_filename)
-          return EXIT_DOWNLOAD
-        if declared is not None and written > declared:
-          print()
-          print('Error: firmware download sent more data than its declared '
-                'Content-Length (%d declared, %d received) -- aborting.'
-                % (declared, written))
-          _remove_quietly(part_filename)
-          return EXIT_DOWNLOAD
-        sys.stdout.write('.')
-        sys.stdout.flush()
-  except (OSError, http.client.HTTPException) as e:
-    print()
-    print('Error: firmware download interrupted: %s' % e)
-    _remove_quietly(part_filename)
-    return EXIT_DOWNLOAD
+          print('Vendor confirmed (HTTP 304) the retained image is current: %s'
+                % os.path.abspath(backup_path))
+          print('No download was performed; reusing the retained image.')
+          filename = backup_path
+          break
+        # The file changed under us between the state check and the 304. Do not
+        # trust it: fall back to a full, unconditional download. Carry the
+        # re-checked classification forward too, so the promote below never
+        # compares the fresh bytes against a stale 'verified' judgement.
+        retained_state, retained_digest = reuse_state, reuse_digest
+        print('Retained image no longer matches its recorded digest; '
+              'downloading it again unconditionally.')
+        conditional = {}
+        continue
+      print('Error: HTTP %d (%s) from Brother CDN -- try again later.' % (e.code, e.reason))
+      return EXIT_DOWNLOAD
+    except urllib.error.URLError as e:
+      print('Error: download failed: %s' % e.reason)
+      return EXIT_DOWNLOAD
 
-  print('done')
+    content_length = response.headers.get('Content-Length')
+    declared = None
+    if content_length is not None:
+      try:
+        declared = int(content_length)
+      except (TypeError, ValueError):
+        declared = None
 
-  # Verify before promoting the partial file to a real firmware name.
-  valid, err = _verify_firmware_integrity(part_filename, content_length=content_length)
-  if not valid:
-    print('Error: firmware integrity check failed: %s' % err)
-    _remove_quietly(part_filename)
-    return EXIT_DOWNLOAD
-
-  # Promote the verified image into its retained recovery location. The file
-  # was downloaded inside that directory, so this is normally a same-filesystem
-  # rename; if it still fails, keep the verified image rather than deleting it.
-  #
-  # Compare the freshly downloaded bytes with what was verified last time first.
-  # Only a 'verified' retained copy can be compared; for anything else the
-  # digest is unknown and the new bytes are promoted unconditionally.
-  #
-  # Reading the partial back can fail (the file was deleted between the
-  # integrity check and here, or the disk failed). That is the same class of
-  # failure as a failed promote, so it reports the same way: EXIT_DOWNLOAD,
-  # and the verified image is named rather than deleted.
-  try:
-    new_digest = _sha256_file(part_filename)
-  except OSError as e:
-    print('Error: could not re-read the downloaded firmware image: %s' % e)
-    print('The verified image is still at: %s' % os.path.abspath(part_filename))
-    return EXIT_DOWNLOAD
-  replace_needed = True
-  if retained_state == 'verified' and new_digest == retained_digest:
-    print('Vendor artifact is unchanged; the retained image is already these '
-          'exact bytes. Nothing rewritten.')
-    _remove_quietly(part_filename)
-    replace_needed = False
-  elif retained_state == 'verified':
-    print('WARNING: the vendor artifact for this version DIFFERS from the '
-          'retained copy.')
-    print('  retained digest: %s' % retained_digest)
-    print('  vendor digest:   %s' % new_digest)
-    print('Brother may have republished this version under the same filename; '
-          'the new bytes replace the retained image.')
-
-  if replace_needed:
+    written = 0
     try:
-      os.replace(part_filename, backup_path)
+      with open(part_filename, 'wb') as f:
+        while True:
+          block = response.read(DOWNLOAD_CHUNK)
+          if not block: break
+          f.write(block)
+          written += len(block)
+          # R10: bound the loop. Without this a broken or hostile source writes
+          # until the disk fills, and a truncated artifact cannot be told from a
+          # complete one by its name.
+          if written > DOWNLOAD_HARD_CAP:
+            print()
+            print('Error: firmware download exceeded the %d MB safety cap '
+                  '(%d bytes received) -- aborting.'
+                  % (DOWNLOAD_HARD_CAP // (1024 * 1024), written))
+            _remove_quietly(part_filename)
+            return EXIT_DOWNLOAD
+          if declared is not None and written > declared:
+            print()
+            print('Error: firmware download sent more data than its declared '
+                  'Content-Length (%d declared, %d received) -- aborting.'
+                  % (declared, written))
+            _remove_quietly(part_filename)
+            return EXIT_DOWNLOAD
+          sys.stdout.write('.')
+          sys.stdout.flush()
+    except (OSError, http.client.HTTPException) as e:
+      print()
+      print('Error: firmware download interrupted: %s' % e)
+      _remove_quietly(part_filename)
+      return EXIT_DOWNLOAD
+
+    print('done')
+
+    # Verify before promoting the partial file to a real firmware name.
+    valid, err = _verify_firmware_integrity(part_filename, content_length=content_length)
+    if not valid:
+      print('Error: firmware integrity check failed: %s' % err)
+      _remove_quietly(part_filename)
+      return EXIT_DOWNLOAD
+
+    # Promote the verified image into its retained recovery location. The file
+    # was downloaded inside that directory, so this is normally a same-filesystem
+    # rename; if it still fails, keep the verified image rather than deleting it.
+    #
+    # Compare the freshly downloaded bytes with what was verified last time first.
+    # Only a 'verified' retained copy can be compared; for anything else the
+    # digest is unknown and the new bytes are promoted unconditionally.
+    #
+    # Reading the partial back can fail (the file was deleted between the
+    # integrity check and here, or the disk failed). That is the same class of
+    # failure as a failed promote, so it reports the same way: EXIT_DOWNLOAD,
+    # and the verified image is named rather than deleted.
+    try:
+      new_digest = _sha256_file(part_filename)
     except OSError as e:
-      print('Error: could not store firmware backup: %s' % e)
+      print('Error: could not re-read the downloaded firmware image: %s' % e)
       print('The verified image is still at: %s' % os.path.abspath(part_filename))
       return EXIT_DOWNLOAD
-    # Record the digest now that the bytes are in place. --test retains the
-    # image, so it must leave the same record behind as a flashing run. A record
-    # that cannot be written is not fatal: a missing record means "unknown", and
-    # the next run re-downloads and re-verifies. Never trade the image for it.
+    replace_needed = True
+    if retained_state == 'verified' and new_digest == retained_digest:
+      print('Vendor artifact is unchanged; the retained image is already these '
+            'exact bytes. Nothing rewritten.')
+      _remove_quietly(part_filename)
+      replace_needed = False
+    elif retained_state == 'verified':
+      print('WARNING: the vendor artifact for this version DIFFERS from the '
+            'retained copy.')
+      print('  retained digest: %s' % retained_digest)
+      print('  vendor digest:   %s' % new_digest)
+      print('Brother may have republished this version under the same filename; '
+            'the new bytes replace the retained image.')
+
+    if replace_needed:
+      try:
+        os.replace(part_filename, backup_path)
+      except OSError as e:
+        print('Error: could not store firmware backup: %s' % e)
+        print('The verified image is still at: %s' % os.path.abspath(part_filename))
+        return EXIT_DOWNLOAD
+      # Record the digest now that the bytes are in place. --test retains the
+      # image, so it must leave the same record behind as a flashing run. A record
+      # that cannot be written is not fatal: a missing record means "unknown", and
+      # the next run re-downloads and re-verifies. Never trade the image for it.
+      try:
+        _write_sidecar(backup_path, new_digest)
+      # aislop-ignore-next-line ai-slop/swallowed-exception -- the handler reports the failure; a missing record is fail-open and never costs the verified image.
+      except OSError as e:
+        print('WARNING: could not record the firmware digest at %s: %s'
+              % (_sidecar_path(backup_path), e))
+        print('The image is retained; the next run will re-download and re-verify.')
+
+    # Refresh the vendor validator after every successful body download, even
+    # when the bytes were identical and the 15 MB image was not rewritten: a
+    # stale validator would silently disable the next run's conditional request.
     try:
-      _write_sidecar(backup_path, new_digest)
-    # aislop-ignore-next-line ai-slop/swallowed-exception -- the handler reports the failure; a missing record is fail-open and never costs the verified image.
+      _write_validator(backup_path, response.headers)
+    # aislop-ignore-next-line ai-slop/swallowed-exception -- the handler reports the failure; a missing validator is fail-open and only costs a future download.
     except OSError as e:
-      print('WARNING: could not record the firmware digest at %s: %s'
-            % (_sidecar_path(backup_path), e))
-      print('The image is retained; the next run will re-download and re-verify.')
-  filename = backup_path
+      print('WARNING: could not record the vendor validator at %s: %s'
+            % (_validator_path(backup_path), e))
+      print('The image is retained; the next run will download it again to be safe.')
+
+    filename = backup_path
+    break
 
   if args.test:
     print('Test mode: no upload attempted.')

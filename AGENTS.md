@@ -16,7 +16,7 @@ or FTP upload.
   must equal **`37f53a239b86f53d385d45047b8ceb07`**. If that changes, attribution
   was altered — restore it rather than reformatting around it.
 - **License:** GPLv2 (`GPL-2.0-only` in packaging, which matches the header)
-- **Lines:** ~1,360 in a single file (`oh_brother.py`)
+- **Lines:** ~1,480 in a single file (`oh_brother.py`)
 - **Version:** `0.4.0`, read at runtime via `importlib.metadata` (never a
   duplicated literal) with a `0.0.0+source` fallback when run uninstalled
 - **Installed as** the `oh-brother` console script via `pyproject.toml`
@@ -95,6 +95,9 @@ guessed interval.
 | `_sidecar_path(backup_path)` | `backup_path + SHA256_SUFFIX` — where the digest record lives |
 | `_write_sidecar(backup_path, digest)` | Records `<digest>  <basename>\n` (sha256sum format) atomically via a `.tmp` sibling + rename. Raises on failure; the caller decides |
 | `_retained_copy_state(backup_path)` | `(state, digest_or_None)` — one of `'absent'`/`'verified'`/`'unrecorded'`/`'corrupt'`. A missing or malformed record is `'unrecorded'`, never `'corrupt'` |
+| `_validator_path(backup_path)` | `backup_path + VALIDATOR_SUFFIX` — where the vendor's conditional-request validator lives |
+| `_write_validator(backup_path, headers)` | Records the response's `ETag` (else `Last-Modified`) as one `<Header-Name>: <value>` line, atomically via a `.tmp` sibling + rename; neither header removes any stale record. Raises on failure; the caller decides |
+| `_conditional_headers(backup_path)` | `{'If-None-Match': …}` from a stored `ETag`, or `{'If-Modified-Since': …}` from a stored `Last-Modified`; `{}` for a missing or malformed record, so the fetch stays unconditional |
 | `_remove_quietly(path)` | Delete, ignoring failure (never fails the primary operation) |
 | `_retained_message(path)` | "the image is still at …" |
 | `_incomplete_message(path)` | `TRANSFER INCOMPLETE — DO NOT POWER OFF; reflash from …` |
@@ -118,12 +121,13 @@ guessed interval.
 | `SnmpError(Exception)` | Carries `exit_code`, so the caller learns *why* rather than getting a traceback |
 | `prompt(msg)` | `input()` only when stdin is a TTY — and nothing in the flash path depends on that no-op any more |
 
-**Module constants (32):** `BROTHER_API_URL`, `BROTHER_SNMP_OID`,
+**Module constants (33):** `BROTHER_API_URL`, `BROTHER_SNMP_OID`,
 `FW_VERSION_SENTINEL`, the `EXIT_*` codes, `UPLOAD_OK`/`UPLOAD_FAILED`/
 `UPLOAD_INCOMPLETE`, `UPLOAD_SOCKET_TIMEOUT`, `UPLOAD_STALL_DEADLINE`,
 `FTP_TIMEOUT`, `SNMP_TIMEOUT`/`SNMP_RETRIES`/`SNMP_DEADLINE`,
 `FLASH_VERIFY_TIMEOUT`/`FLASH_VERIFY_POLL`, `BACKUP_DIRNAME`,
-`BACKUP_DIR_ENV`, `SHA256_SUFFIX`, `DOWNLOAD_CHUNK`/`DOWNLOAD_HARD_CAP`,
+`BACKUP_DIR_ENV`, `SHA256_SUFFIX`, `VALIDATOR_SUFFIX`,
+`DOWNLOAD_CHUNK`/`DOWNLOAD_HARD_CAP`,
 `READY_TIMEOUT`/`READY_POLL`, plus the
 `reqInfo` XML template. Every timeout is a named constant with the arithmetic
 written out in a comment — do not inline a duration.
@@ -180,6 +184,7 @@ Module is import-safe: `if __name__ == '__main__':` guard.
 | Unique partial name | `tempfile.mkstemp()` in the backup directory | Two concurrent runs colliding on a predictable `<name>.part` and clobbering each other's in-flight download |
 | Early backup check | `os.makedirs()` before the `urlopen` | Spending ~15 MB before discovering an unwritable backup root. Returns `EXIT_DOWNLOAD` with the resolved path |
 | Post-flash verification | `_verify_flash()` | Trusting "the socket did not raise". TCP 9100 is fire-and-forget — a completed write is not an accepted image |
+| Conditional reuse | `_conditional_headers()`, `_write_validator()` | Re-fetching 15 MB the tool already holds. A `304` reuses the retained image only when the sidecar says `verified` **and** the vendor validator corroborates that those bytes are still served; a missing validator, a non-`verified` copy, or a `304` whose copy stops re-verifying all fall back to a full download |
 
 ## CLI reference
 
@@ -273,7 +278,7 @@ error" when the tool returns structured exit codes.
 
 ## Testing
 
-**148 tests, 26 classes.** Run: `python3 -m pytest tests/ -q`
+**159 tests, 27 classes.** Run: `python3 -m pytest tests/ -q`
 
 | Class | Tests | What it covers |
 |---|---|---|
@@ -298,7 +303,8 @@ error" when the tool returns structured exit codes.
 | `TestBoundedDownload` | 3 | R10: body past Content-Length aborts at the first chunk, hard cap with no header, honest download unaffected |
 | `TestBackupRootAndPartial` | 7 | P5: env-var backup root with CWD fallback, unusable root fails before `urlopen`, unique partial name leaves a stale `.part` alone, failed promote keeps the verified image, a download that never starts leaves no partial behind |
 | `TestRetainedCopyState` | 6 | Packet 3A: `absent`/`verified`/`unrecorded`/`corrupt`; a garbage or non-hex sidecar is `unrecorded`, never `corrupt`; replacing the file under an unchanged record reads `corrupt` |
-| `TestRetainedCopyChangeDetection` | 5 | Packet 3A: a wrong recorded hash still forces a real re-download (G2), the sidecar is sha256sum format, unchanged bytes skip the rewrite, changed bytes name both digests and promote, a failed record write keeps the image and exit code |
+| `TestRetainedCopyChangeDetection` | 6 | Packet 3A: a wrong recorded hash still forces a real re-download (G2), the sidecar is sha256sum format, unchanged bytes skip the rewrite, changed bytes name both digests and promote, a failed record write keeps the image and exit code, and a read failure at promote reports `EXIT_DOWNLOAD` rather than a traceback |
+| `TestConditionalReuse` | 10 | Packet 3B: a `304` reuses the retained image without reading a body or touching the file, a `304` is never reported as a download failure, no validator or a non-`verified` copy sends no conditional header, `ETag`/`Last-Modified` map to the right header, a `200` with a validator still downloads, a `304` whose copy stops re-verifying falls back to a full download, and the validator is written from the response headers and refreshed even when the bytes are identical |
 | `TestBetaGate` | 3 | R13: `--beta` needs `--yes`; `--yes` and `--test` pass the gate |
 | `TestFailureTraceback` | 3 | R17: traceback kept, one frame by default, full chain under `--verbose` |
 | `TestFtpUploadOutcome` | 1 | R9: a failed `QUIT` must not discard a completed `STOR` |

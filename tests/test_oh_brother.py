@@ -2563,3 +2563,295 @@ class TestRetainedCopyChangeDetection:
         assert "could not re-read" in out
         # The image is named so it can be recovered -- never silently dropped.
         assert ".part" in out
+
+
+class TestConditionalReuse:
+    """Packet 3B: reuse a verified retained image when the vendor confirms it.
+
+    A 304 is only sound when 3A says the retained copy is 'verified' AND the
+    vendor supplied a validator to condition on. The digest alone is never
+    vendor corroboration (gate G2), so a wrong or missing record still fetches.
+    ``urllib`` raises ``HTTPError`` for a 304 rather than returning a response,
+    so the reuse decision has to be taken inside the HTTPError handler; a naive
+    form reports a successful reuse as a download failure.
+    """
+
+    ARTIFACT = ARTIFACT_124
+
+    def _arm(self, monkeypatch, tmp_path):
+        oh.args = _args(test=True)
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+        monkeypatch.delenv("OH_BROTHER_BACKUP_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+
+    def _backup(self, tmp_path):
+        return (tmp_path / "firmware_backups" / "HL-L2865DW" / "1.24"
+                / self.ARTIFACT)
+
+    def _sidecar(self, backup):
+        return backup.parent / (backup.name + ".sha256")
+
+    def _validator(self, backup):
+        return backup.parent / (backup.name + ".validator")
+
+    def _seed_verified(self, tmp_path, body, validator='ETag: "v1"\n'):
+        backup = self._backup(tmp_path)
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        backup.write_bytes(body)
+        self._sidecar(backup).write_text(
+            "%s  %s\n" % (hashlib.sha256(body).hexdigest(), self.ARTIFACT))
+        if validator is not None:
+            self._validator(backup).write_text(validator)
+        return backup
+
+    def _http_304(self):
+        return urllib.error.HTTPError(
+            "http://update-akamai.brother.co.jp/CS/x.djf", 304,
+            "Not Modified", {}, None)
+
+    def _fake_200(self, attempts, body, headers=None):
+        from unittest.mock import MagicMock
+
+        def fake_urlopen(req, timeout=None):
+            attempts.append(req)
+            m = MagicMock()
+            m.headers = dict(headers or {})
+            m.headers.setdefault("Content-Length", str(len(body)))
+            m.read.side_effect = [body, b""]
+            return m
+
+        return fake_urlopen
+
+    @staticmethod
+    def _header(req, name):
+        for key, value in req.headers.items():
+            if key.lower() == name.lower():
+                return value
+        return None
+
+    def test_304_reuses_the_retained_image(self, monkeypatch, tmp_path, capsys):
+        """A vendor 304 means the retained image is current; no body is read."""
+        body = b"B" * 204800
+        backup = self._seed_verified(tmp_path, body)
+        self._arm(monkeypatch, tmp_path)
+        before = backup.stat()
+        attempts = []
+
+        def fake_urlopen(req, timeout=None):
+            attempts.append(req)
+            raise self._http_304()
+
+        monkeypatch.setattr(oh.urllib.request, "urlopen", fake_urlopen)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_OK
+        assert len(attempts) == 1
+        after = backup.stat()
+        assert (after.st_ino, after.st_mtime_ns) == (
+            before.st_ino, before.st_mtime_ns)
+        assert backup.read_bytes() == body
+        assert "304" in out
+        assert os.path.abspath(str(backup)) in out
+        assert "no download" in out.lower()
+        assert not list(backup.parent.glob("*.part"))
+
+    def test_304_is_not_reported_as_a_download_failure(
+            self, monkeypatch, tmp_path, capsys):
+        """The trap: urllib raises HTTPError(304); a reuse must not read as 6."""
+        backup = self._seed_verified(tmp_path, b"B" * 204800)
+        self._arm(monkeypatch, tmp_path)
+
+        def fake_urlopen(req, timeout=None):
+            raise self._http_304()
+
+        monkeypatch.setattr(oh.urllib.request, "urlopen", fake_urlopen)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result != oh.EXIT_DOWNLOAD
+        assert result == oh.EXIT_OK
+        assert "try again later" not in out
+        assert backup.exists()
+
+    def test_no_validator_sends_no_conditional_header(
+            self, monkeypatch, tmp_path):
+        """No stored validator means nothing to condition on: fetch as before."""
+        body = b"B" * 204800
+        self._seed_verified(tmp_path, body, validator=None)
+        self._arm(monkeypatch, tmp_path)
+        attempts = []
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            self._fake_200(attempts, b"C" * 204800))
+
+        result = oh.update_firmware("MAIN", "1.24")
+
+        assert result == oh.EXIT_OK
+        assert len(attempts) == 1
+        assert self._header(attempts[0], "If-None-Match") is None
+        assert self._header(attempts[0], "If-Modified-Since") is None
+        assert self._backup(tmp_path).read_bytes() == b"C" * 204800
+
+    def test_corrupt_retained_copy_never_produces_reuse(
+            self, monkeypatch, tmp_path):
+        """G2 carried through: a wrong recorded hash must not yield a 304 path."""
+        backup = self._backup(tmp_path)
+        backup.parent.mkdir(parents=True)
+        backup.write_bytes(b"old retained bytes")
+        self._sidecar(backup).write_text(
+            "%s  %s\n" % ("0" * 64, self.ARTIFACT))
+        self._validator(backup).write_text('ETag: "v1"\n')
+        self._arm(monkeypatch, tmp_path)
+        fresh = b"D" * 204800
+        attempts = []
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            self._fake_200(attempts, fresh))
+
+        result = oh.update_firmware("MAIN", "1.24")
+
+        assert result == oh.EXIT_OK
+        assert len(attempts) == 1
+        assert self._header(attempts[0], "If-None-Match") is None
+        assert backup.read_bytes() == fresh
+
+    def test_200_with_validator_downloads_normally(
+            self, monkeypatch, tmp_path):
+        """A validator present still converges on the normal download path."""
+        body = b"B" * 204800
+        backup = self._seed_verified(tmp_path, body, validator='ETag: "v1"\n')
+        self._arm(monkeypatch, tmp_path)
+        attempts = []
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            self._fake_200(attempts, body, {"ETag": '"v1"'}))
+
+        result = oh.update_firmware("MAIN", "1.24")
+
+        assert result == oh.EXIT_OK
+        assert len(attempts) == 1
+        assert self._header(attempts[0], "If-None-Match") == '"v1"'
+        assert backup.exists()
+
+    def test_last_modified_validator_sends_if_modified_since(
+            self, monkeypatch, tmp_path):
+        """A Last-Modified validator maps to If-Modified-Since, not If-None-Match."""
+        body = b"B" * 204800
+        when = "Wed, 01 Jan 2025 00:00:00 GMT"
+        backup = self._seed_verified(
+            tmp_path, body, validator="Last-Modified: %s\n" % when)
+        self._arm(monkeypatch, tmp_path)
+        attempts = []
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            self._fake_200(attempts, body,
+                                           {"Last-Modified": when}))
+
+        result = oh.update_firmware("MAIN", "1.24")
+
+        assert result == oh.EXIT_OK
+        assert len(attempts) == 1
+        assert self._header(attempts[0], "If-Modified-Since") == when
+        assert self._header(attempts[0], "If-None-Match") is None
+        assert backup.exists()
+
+    def test_304_after_copy_stops_verifying_falls_back(
+            self, monkeypatch, tmp_path, capsys):
+        """A 304 for a copy that no longer re-verifies must fail open, not abort.
+
+        The vendor then serves bytes identical to the recorded digest. A stale
+        'verified' judgement would skip the promote and leave the tampered file
+        in place, so the fallback must carry the re-checked classification
+        forward and promote the freshly downloaded bytes.
+        """
+        body = b"B" * 204800
+        backup = self._seed_verified(tmp_path, body)
+        self._arm(monkeypatch, tmp_path)
+        attempts = []
+        state = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            attempts.append(req)
+            state["n"] += 1
+            if state["n"] == 1:
+                # The file changes under us before the 304 is handled.
+                backup.write_bytes(b"tampered")
+                raise self._http_304()
+            from unittest.mock import MagicMock
+            m = MagicMock()
+            m.headers = {"Content-Length": str(len(body))}
+            m.read.side_effect = [body, b""]
+            return m
+
+        monkeypatch.setattr(oh.urllib.request, "urlopen", fake_urlopen)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_OK
+        assert len(attempts) == 2
+        assert self._header(attempts[0], "If-None-Match") == '"v1"'
+        assert self._header(attempts[1], "If-None-Match") is None
+        assert backup.read_bytes() == body
+
+    def test_validator_written_from_response_headers(
+            self, monkeypatch, tmp_path):
+        """Retention records the vendor validator as one '<Header>: <value>' line.
+
+        Both headers are offered here because that is what the real CDN sends,
+        and Last-Modified has to win: it is the one that CDN acts on, while
+        If-None-Match carrying the same response's ETag returns 200 every time
+        (probed: exact ETag, lowercase name, and md5 prefix alone). The
+        ETag-only fallback is covered by the rewrite test below, so reverting
+        this preference to the stronger-looking validator fails here.
+        """
+        self._arm(monkeypatch, tmp_path)
+        attempts = []
+        monkeypatch.setattr(
+            oh.urllib.request, "urlopen",
+            self._fake_200(attempts, b"B" * 204800, {
+                "ETag": '"5f8a-1c2d"',
+                "Last-Modified": "Thu, 30 Apr 2026 10:28:09 GMT"}))
+
+        result = oh.update_firmware("MAIN", "1.24")
+
+        assert result == oh.EXIT_OK
+        validator = self._validator(self._backup(tmp_path))
+        assert validator.read_text() == (
+            'Last-Modified: Thu, 30 Apr 2026 10:28:09 GMT\n')
+
+    def test_validator_rewritten_when_bytes_are_identical(
+            self, monkeypatch, tmp_path):
+        """Stale validators silently disable reuse, so they are refreshed."""
+        body = b"B" * 204800
+        backup = self._seed_verified(
+            tmp_path, body, validator="Last-Modified: old\n")
+        self._arm(monkeypatch, tmp_path)
+        before = backup.stat()
+        attempts = []
+        monkeypatch.setattr(
+            oh.urllib.request, "urlopen",
+            self._fake_200(attempts, body, {"ETag": '"new"'}))
+
+        result = oh.update_firmware("MAIN", "1.24")
+
+        assert result == oh.EXIT_OK
+        after = backup.stat()
+        assert (after.st_ino, after.st_mtime_ns) == (
+            before.st_ino, before.st_mtime_ns)
+        assert self._validator(backup).read_text() == 'ETag: "new"\n'
+
+    def test_no_validator_headers_write_no_validator_file(
+            self, monkeypatch, tmp_path):
+        """Neither ETag nor Last-Modified means nothing to store."""
+        self._arm(monkeypatch, tmp_path)
+        attempts = []
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            self._fake_200(attempts, b"B" * 204800))
+
+        result = oh.update_firmware("MAIN", "1.24")
+
+        assert result == oh.EXIT_OK
+        assert not self._validator(self._backup(tmp_path)).exists()

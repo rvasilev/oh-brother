@@ -91,7 +91,19 @@ Currently the script does the following:
     * Retain the downloaded image under
       `firmware_backups/<MODEL>/<version>/` as a recovery copy. Set the
       `OH_BROTHER_BACKUP_DIR` environment variable to keep that tree under a
-      different root; unset, it is the working directory.
+      different root; unset, it is the working directory. Beside the image the
+      tool records a `.sha256` digest of the bytes it verified, and, when the
+      vendor supplied one, a `.validator` file holding the vendor's
+      `Last-Modified` (or its `ETag` when there is no `Last-Modified`) as a
+      single `Header-Name: value` line. On the next run the tool asks the vendor
+      whether a retained, digest-verified image is still current
+      (`If-Modified-Since`, or `If-None-Match` for an ETag); if the vendor
+      answers `304 Not Modified` the image is reused and nothing is downloaded,
+      and if it answers `200` the image is fetched and verified as usual. No
+      validator stored, a digest that does not match, or a `304` for a copy that
+      no longer matches its digest all fall back to a full download.
+      `Last-Modified` is preferred deliberately: Brother's CDN ignores
+      `If-None-Match` and answers `304` only to `If-Modified-Since`.
     * Ask the user whether to proceed with updating (or, with `--yes`, proceed).
     * Upload the firmware to the printer via either TCP port 9100
       (passwordless) or FTP (with admin password).

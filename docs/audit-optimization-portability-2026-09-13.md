@@ -192,10 +192,17 @@ already passed. This is the only code path that can damage `firmware_backups/`. 
 
 **Fix (M), two independent parts:**
 
-1. **Cheap vendor-authoritative reuse.** The CDN honours conditional requests (verified: `304` with an
-   `ETag` whose prefix is the artifact's md5). The tool already calls the vendor API on every run, so send
-   `If-None-Match`/`If-Modified-Since` from the retained file's hash/mtime: `304` → reuse, print the
-   decision; `200` → download as today. No new file format, no new assumption, and it fails open.
+1. **Cheap vendor-authoritative reuse.** The CDN honours conditional requests, but **only via
+   `If-Modified-Since`** — a correction to this audit's first draft, which credited the `304` below to the
+   `ETag` and prescribed `If-None-Match` (see the reproducer in the appendix, which sent
+   `If-Modified-Since` and got a real `304`). Measured against the live artifact: sending its own
+   `ETag` back in `If-None-Match` returns `200` every time (exact value, lowercase header name, and the
+   md5 prefix alone), while sending its own `Last-Modified` in `If-Modified-Since` returns `304`. The
+   ETag is genuine — `"<md5 of the artifact>:<timestamp>"` — and simply ignored by that edge. The tool
+   already calls the vendor API on every run, so record the validator at retention and send it back:
+   `304` → reuse, print the decision; `200` → download as today. No new file format, no new assumption,
+   and it fails open. Prefer `Last-Modified` over the stronger-looking `ETag` on that measurement, not
+   on taste: a validator the server ignores costs a full 15 MB download on every run.
 2. **Protect the retained copy.** Record a `sha256` sidecar at retention time; before overwriting, compare.
    A missing or mismatched sidecar means download, never trust.
 
@@ -405,6 +412,17 @@ PYTHONIOENCODING=ascii python3 /tmp/probe_exit_code.py  # -> main-returned-1
 curl -sI http://update-akamai.brother.co.jp/CS/D02FZM_124Q_crypt.djf | grep -iE 'etag|last-modified|content-length'
 curl -s -o /dev/null -w '%{http_code}\n' -H "If-Modified-Since: $(date -u -R)" \
      http://update-akamai.brother.co.jp/CS/D02FZM_124Q_crypt.djf     # -> 304
+
+# P4 correction: which validator does it actually act on? Send each one back.
+ETAG=$(curl -sI http://update-akamai.brother.co.jp/CS/D02FZM_124Q_crypt.djf \
+       | sed -n 's/^[Ee][Tt][Aa][Gg]: *//p' | tr -d '\r')
+LM=$(curl -sI http://update-akamai.brother.co.jp/CS/D02FZM_124Q_crypt.djf \
+     | sed -n 's/^[Ll]ast-[Mm]odified: *//p' | tr -d '\r')
+curl -s -o /dev/null -w 'If-None-Match  -> %{http_code}\n' -H "If-None-Match: $ETAG" \
+     http://update-akamai.brother.co.jp/CS/D02FZM_124Q_crypt.djf     # -> 200 (ignored)
+curl -s -o /dev/null -w 'If-Modified-Since -> %{http_code}\n' -H "If-Modified-Since: $LM" \
+     http://update-akamai.brother.co.jp/CS/D02FZM_124Q_crypt.djf     # -> 304 (honoured)
 ```
 
-**Last reviewed:** 2026-09-13 (branch `harden` @ `9a2f7e5`, 128 tests passing, no drift)
+**Last reviewed:** 2026-09-13 (branch `harden`, 159 tests passing and no drift as of Packet 3B; §P4's
+conditional-request prescription was corrected after the live run — the ETag is not honoured, see the appendix)
