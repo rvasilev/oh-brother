@@ -115,7 +115,8 @@ return site must emit a code.
   spins (measured: 200,001 `read()` calls). Fix the mock, and sever the API leg at the
   `_http_post` seam so `urlopen` is unambiguously the download.
 
-### Phase 5 — Follow-ups (explicitly deferred, not forgotten)
+### Phase 5 — Follow-ups — CLOSED
+
 R9 FTP timeout · R10 bounded download + `.part` atomicity · R11 readiness poll instead of
 `sleep(30)` · R12 `-f` requires `-c` · R13 `--beta` needs `--yes` · R14 `_decrement_version`
 zero-padding · R15 `getaddrinfo` inside `try` · R17 traceback on `--verbose` · R19 signal
@@ -123,6 +124,22 @@ handling. Also deferred: full `logging` refactor (60 call sites — exit codes a
 cron signal), full type hints (except the load-bearing `main() -> int`), `--log-file`,
 `--dry-run` as distinct from `--test` (rejected — `--test` already is one). Add `--json` only
 when a second consumer actually exists.
+
+**Landed** in `7687a5d` and `480633c`. The deliberately rejected/deferred items above stay
+closed by decision, not by neglect. Still open from the audit: R16 (no reachability preflight
+before the ~15 MB download) and R18 (unused `ip` parameter in `_tcp_upload`).
+
+One correction to the audit worth recording. R12 was rated MEDIUM, but `-c` on its own sent the
+`B0000000000` sentinel as the installed version — and that is exactly the value the downgrade
+check compares the artifact against. `_version_tuple('B0000000000')` is `None`, so forcing a
+category silently turned the R7 downgrade *refusal* into a warning, in the one code path a user
+enters specifically to force an unusual flash. It is now looked up from the SNMP map, with a
+refusal when the printer does not report that category at all.
+
+Verification note for anyone reading this later: R12, R13, R14 and the honest download path were
+verified live against HL-L2865DW @ 192.168.88.65 using read-only commands only. R9's FTP
+teardown, R10's abort path and R11's readiness poll are unit-tested only — exercising them live
+would need a real flash (R9, R11) or a vendor CDN that lies about `Content-Length` (R10).
 
 ## 4. Decision gates
 

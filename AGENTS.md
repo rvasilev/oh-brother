@@ -104,7 +104,7 @@ Module is import-safe: `if __name__ == '__main__':` guard.
   -t, --test       Check firmware availability (no upload)
   -c, --category   Force a specific firmware category (MAIN, SUB1, etc.)
   -m, --model      Force a specific printer model
-  -f, --version    Force a specific firmware version (requires --category)
+  -f, --fw-version  Force a specific firmware version (requires --category)
   -v, --verbose    Verbose output (SNMP dump, XML request/response)
   --beta           Query for beta firmware (INSPECTMODE=1)
   -p, --password   Upload via FTP using printer admin password
@@ -138,14 +138,15 @@ failure is never hidden behind another category's success — and prints
 |---|---|---|
 | 0 | `EXIT_OK` | Uploaded and verified, or `--test` fetched and verified an image |
 | 1 | `EXIT_ERROR` | Unexpected internal error |
-| 2 | `EXIT_USAGE` | Bad arguments |
+| 2 | `EXIT_USAGE` | Bad arguments (including `-f` without `-c`) |
 | 3 | `EXIT_CURRENT` | Printer already current — the healthy cron no-op |
 | 4 | `EXIT_PRINTER` | Printer unreachable |
 | 5 | `EXIT_VENDOR` | Brother API error / no firmware URL |
 | 6 | `EXIT_DOWNLOAD` | Download or integrity check failed |
 | 7 | `EXIT_UPLOAD` | Upload failed, rejected, or version mismatch |
 | 8 | `EXIT_UNVERIFIED` | Uploaded but the printer did not come back in time |
-| 9 | `EXIT_REFUSED` | A safety gate declined |
+| 9 | `EXIT_REFUSED` | A safety gate declined (unattended flash, downgrade, `--beta` without `--yes`, forced category whose installed version is unknown) |
+| 130 | `EXIT_INTERRUPTED` | Ctrl-C outside the upload window (shell SIGINT convention) |
 
 **Code 8 is not a failure.** A Brother laser reboots for 60–120 s after a flash,
 and reporting a false FAILED there is how people end up reflashing a printer
@@ -154,23 +155,32 @@ an unparseable expected version yields `unverified`, not a false `mismatch`.
 
 ## Testing
 
-**91 tests, 13 classes.** Run: `python3 -m pytest tests/ -q`
+**128 tests, 22 classes.** Run: `python3 -m pytest tests/ -q`
 
 | Class | Tests | What it covers |
 |---|---|---|
 | `TestCLI` | 19 (parameterized) | All boolean flags, string args, category+version combo, IP required, `--reflash` |
 | `TestSafetyGates` | 9 | Default-deny: already-current terminal, non-TTY refusal, downgrade refusal, no-override-flag |
 | `TestValidateFirmwareUrl` | 8 | Valid HTTP/HTTPS, .upd, wrong domain, file://, wrong ext, empty, query params |
+| `TestSnmpFailureClassification` | 7 | Walk raises `SnmpError` instead of `sys.exit(1)`; off printer is exit 4, protocol error exit 1; bounded SNMP budget and deadline; rebooting printer tolerated |
 | `TestParseSnmpTable` | 7 | Real printer data, multi-FW, ordering edge cases, empty table, verbose |
+| `TestMainSmoke` | 7 | SNMP pipeline, model/category override, SNMP errors, category+version, readiness poll between categories |
 | `TestFlashHardening` | 7 | Tri-state upload, image retention, partial-file promotion, post-flash verify |
+| `TestDecrementVersion` | 7 | Normal, zero-padding preserved (`2.10`→`2.09`), zero minor borrows the major, non-numeric, empty |
+| `TestPrinterReadiness` | 6 | R11: readiness poll returns fast when up, bounded deadline when not, SNMP failure reads as not-ready |
 | `TestUpdateFirmware` | 6 | VCHECK=1, no-PATH, `--yes` skip, fallback succeed/fail, `--test` stops before upload |
-| `TestMainSmoke` | 6 | SNMP pipeline, model override, category override, SNMP errors, multi-FW cooldown |
 | `TestBuildFirmwareXml` | 6 | XML structure, FIRM→MAIN mapping, IFAX→MAIN mapping, beta flag, bytes output |
 | `TestVerifyFirmwareIntegrity` | 5 | Content-Length match/mismatch, too small, minimum pass, size-only |
 | `TestParseBrotherResponse` | 5 | Up-to-date, update available, no PATH, no VERSIONCHECK, empty response |
 | `TestHttpPost` | 5 | Success, HTTP 503, SSL cert error, timeout, DNS failure |
-| `TestDecrementVersion` | 5 | Normal, zero minor, 3-part, non-numeric, empty |
+| `TestForcedCategoryFlags` | 5 | R12: `-f` requires `-c`, `-c` alone keeps the SNMP installed version, unknown category refused, sentinel is not a version |
 | `TestTcpUpload` | 3 | Full sendfile, short-write retry, zero-return failure |
+| `TestPrinterUnreachable` | 3 | R15: unresolvable/refusing printer is exit 4, not exit 1 |
+| `TestInterruptHandling` | 3 | R19: Ctrl-C mid-upload (7, image retained), mid-verify (8), elsewhere (130) |
+| `TestBoundedDownload` | 3 | R10: body past Content-Length aborts at the first chunk, hard cap with no header, honest download unaffected |
+| `TestBetaGate` | 3 | R13: `--beta` needs `--yes`; `--yes` and `--test` pass the gate |
+| `TestFailureTraceback` | 3 | R17: traceback kept, one frame by default, full chain under `--verbose` |
+| `TestFtpUploadOutcome` | 1 | R9: a failed `QUIT` must not discard a completed `STOR` |
 
 **Test infrastructure:**
 - `tests/conftest.py` — mocks `pysnmp`, `pysnmp.hlapi`, `pysnmp.hlapi.v1arch` at `sys.modules` level
@@ -184,7 +194,7 @@ an unparseable expected version yields `unverified`, not a false `mismatch`.
 
 - `tests/test_oh_brother.py` — imports module via `importlib.util` (loaded by file path)
 - Fixture data captured from a Brother HL-L2865DW printer
-- Custom mocks for `_snmp_walk_table` (async → sync table return) and `time.sleep` (cooldown verification)
+- Custom mocks for `_snmp_walk_table` (async → sync table return) and `oh.time.sleep` (readiness and deadline paths — the fixed cooldown is gone)
 
 ```bash
 # Full test run
@@ -222,14 +232,12 @@ from pysnmp.hlapi.v1arch import (
 
 | Issue | Status |
 |---|---|
-| Downloads to CWD not temp dir | Unfixed (low — single-user CLI) |
-| FTP no timeout, broad exception catch | Unfixed (medium — TCP 9100 is default) |
-| No `--dry-run` flag | Unfixed (low — `--test` downloads then deletes) |
-| `--fw-version` default `B0000000000` magic sentinel | Unfixed (low) |
+| Downloads to CWD, not a temp dir | By design — that path *is* the retained recovery image (`firmware_backups/<MODEL>/<version>/`) |
+| No reachability preflight before the ~15 MB download (R16) | Unfixed (low — the image is retained, so it is waste, not loss) |
+| Unused `ip` parameter in `_tcp_upload` (R18) | Unfixed (cosmetic) |
 | Model name "series" suffix for D01 color lasers | Unfixed (enhancement — VCHECK=2 not handled) |
-| `model`/`spec` can be None → `<NAME>None</NAME>` XML | Unfixed (medium — requires invalid SNMP data) |
-| `except Exception` in main() swallows traceback | Unfixed (low — prints to stderr) |
-| Firmware deleted on upload failure (can't retry) | Unfixed (medium) |
+| No `--json` output | Deferred until a second consumer actually exists |
+| Full `logging` refactor, full type hints, `--log-file`, `--dry-run` | Deferred by decision — exit codes already carry the cron signal |
 
 ## Changelog (fork)
 
@@ -244,3 +252,4 @@ from pysnmp.hlapi.v1arch import (
 | Phase 4 | Safety fixes: URL validation, sendfile retry, firmware integrity, upload cooldown |
 | Phase 5 | HTTP error handling: SSL cert guidance, 503/504 friendly messages, download error wrap |
 | Phase 6 | Simplification: fallback dedup, constants, clean imports, indentation |
+| Phase 7 | Production hardening (branch `harden`): default-deny flashing, frozen exit-code contract, image retention, post-upload verification, packaging + CI, Ctrl-C handling, bounded SNMP/upload/download budgets, readiness polling, and the R9/R10/R11/R12/R13/R14/R17 follow-ups |
