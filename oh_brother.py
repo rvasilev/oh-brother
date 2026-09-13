@@ -26,6 +26,7 @@ from importlib.metadata import version as _dist_version, PackageNotFoundError
 import re
 import asyncio
 import sys
+import io
 import socket
 import ssl
 import os
@@ -460,7 +461,7 @@ def _retained_message(path):
 
 def _incomplete_message(path):
     """Explicit warning for a transfer cut off after partial acceptance."""
-    return ('TRANSFER INCOMPLETE — DO NOT POWER OFF; reflash from %s'
+    return ('TRANSFER INCOMPLETE -- DO NOT POWER OFF; reflash from %s'
             % os.path.abspath(path))
 
 
@@ -472,7 +473,7 @@ def _interrupt_during_upload(path):
     power and how to recover.
     """
     return (
-        '!! INTERRUPTED DURING UPLOAD — DO NOT TURN THE PRINTER OFF !!\n'
+        '!! INTERRUPTED DURING UPLOAD -- DO NOT TURN THE PRINTER OFF !!\n'
         'The printer may have received only part of the firmware image, and\n'
         'a printer that loses power mid-flash can be left unusable.\n'
         'Wait a minute or two, then re-run this tool to send a complete\n'
@@ -486,7 +487,7 @@ def _interrupt_during_verification(path, expected):
     return (
         'Upload finished, so the printer is rebooting now. That is safe,\n'
         'but the result was NOT confirmed (expected version %s).\n'
-        'Wait a minute or two, then re-run this tool to confirm — do not\n'
+        'Wait a minute or two, then re-run this tool to confirm -- do not\n'
         'reflash blindly. Image retained at: %s'
         % (expected, os.path.abspath(path))
     )
@@ -601,7 +602,7 @@ def _http_request(url, data=None, hdrs=None, timeout=30):
         return response.read(), None
     except urllib.error.HTTPError as e:
         return None, (
-            "HTTP %d (%s) from Brother server — "
+            "HTTP %d (%s) from Brother server -- "
             "the firmware service may be temporarily unavailable. "
             "Try again later." % (e.code, e.reason)
         )
@@ -609,7 +610,7 @@ def _http_request(url, data=None, hdrs=None, timeout=30):
         reason = e.reason
         if isinstance(reason, ssl.SSLCertVerificationError):
             return None, (
-                "SSL certificate verification failed — your Python install "
+                "SSL certificate verification failed -- your Python install "
                 "may be missing CA certificates.\n"
                 "  macOS: run /Applications/Python*/Install Certificates.command\n"
                 "  Linux: install ca-certificates package\n"
@@ -617,11 +618,11 @@ def _http_request(url, data=None, hdrs=None, timeout=30):
             )
         if isinstance(reason, socket.timeout):
             return None, (
-                "Connection timed out — check your network and "
+                "Connection timed out: check your network and "
                 "try again. The Brother firmware server may be slow."
             )
         return None, (
-            "Network error: %s — check your internet connection "
+            "Network error: %s -- check your internet connection "
             "and try again." % reason
         )
 
@@ -727,7 +728,7 @@ def update_firmware(cat, version):
     print('         raw artifact filename: %s' % filename)
     print('         parsed artifact version: %r (installed: %r)'
           % (artifact_version, version))
-    print('         Proceeding without a downgrade check — verify manually!')
+    print('         Proceeding without a downgrade check -- verify manually!')
   elif artifact < installed:
     print('REFUSING to flash: artifact version %s is OLDER than the installed '
           'version %s.' % (artifact_version, version))
@@ -753,10 +754,10 @@ def update_firmware(cat, version):
     req = urllib.request.Request(firmwareURL)
     response = urllib.request.urlopen(req, timeout=30)
   except urllib.error.HTTPError as e:
-    print('Error: HTTP %d (%s) from Brother CDN — try again later.' % (e.code, e.reason))
+    print('Error: HTTP %d (%s) from Brother CDN -- try again later.' % (e.code, e.reason))
     return EXIT_DOWNLOAD
   except urllib.error.URLError as e:
-    print('Error: download failed — %s' % e.reason)
+    print('Error: download failed: %s' % e.reason)
     return EXIT_DOWNLOAD
 
   content_length = response.headers.get('Content-Length')
@@ -781,14 +782,14 @@ def update_firmware(cat, version):
         if written > DOWNLOAD_HARD_CAP:
           print()
           print('Error: firmware download exceeded the %d MB safety cap '
-                '(%d bytes received) — aborting.'
+                '(%d bytes received) -- aborting.'
                 % (DOWNLOAD_HARD_CAP // (1024 * 1024), written))
           _remove_quietly(part_filename)
           return EXIT_DOWNLOAD
         if declared is not None and written > declared:
           print()
           print('Error: firmware download sent more data than its declared '
-                'Content-Length (%d declared, %d received) — aborting.'
+                'Content-Length (%d declared, %d received) -- aborting.'
                 % (declared, written))
           _remove_quietly(part_filename)
           return EXIT_DOWNLOAD
@@ -796,7 +797,7 @@ def update_firmware(cat, version):
         sys.stdout.flush()
   except (OSError, http.client.HTTPException) as e:
     print()
-    print('Error: firmware download interrupted — %s' % e)
+    print('Error: firmware download interrupted: %s' % e)
     _remove_quietly(part_filename)
     return EXIT_DOWNLOAD
 
@@ -858,7 +859,7 @@ def update_firmware(cat, version):
           sock.close()
           raise
       except OSError as e:
-        print('Cannot reach the printer at %s:9100 — %s' % (args.ip, e))
+        print('Cannot reach the printer at %s:9100 -- %s' % (args.ip, e))
         print(_retained_message(filename))
         return EXIT_PRINTER
 
@@ -901,7 +902,7 @@ def update_firmware(cat, version):
     return EXIT_UPLOAD
 
   if upload_result is not True:
-    print('Firmware upload failed — the printer did not accept the image.')
+    print('Firmware upload failed: the printer did not accept the image.')
     print(_retained_message(filename))
     return EXIT_UPLOAD
 
@@ -996,6 +997,13 @@ def main() -> int:
     global args, serial, model, spec, firmInfo
 
     try:
+        for _stream in (sys.stdout, sys.stderr):
+            if isinstance(_stream, io.TextIOWrapper):
+                try:
+                    _stream.reconfigure(errors='backslashreplace')
+                except (ValueError, OSError):
+                    pass
+
         args = parser.parse_args()
 
         # R12: -f is only meaningful with -c. Without a category there is
@@ -1046,7 +1054,7 @@ def main() -> int:
                   % (args.ip, SNMP_DEADLINE), file=sys.stderr)
             return EXIT_PRINTER
         except OSError as e:
-            print('Cannot reach the printer at %s:161 — %s' % (args.ip, e),
+            print('Cannot reach the printer at %s:161 -- %s' % (args.ip, e),
                   file=sys.stderr)
             return EXIT_PRINTER
 
@@ -1123,7 +1131,7 @@ def main() -> int:
                 if waited is None:
                     print('The printer did not answer within %d seconds.'
                           % READY_TIMEOUT)
-                    print('Skipping the remaining %d update(s) — re-run once '
+                    print('Skipping the remaining %d update(s) -- re-run once '
                           'it is back.' % (num_firmwares - i - 1))
                     codes.append(EXIT_PRINTER)
                     break

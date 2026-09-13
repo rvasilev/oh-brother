@@ -262,7 +262,7 @@ error" when the tool returns structured exit codes.
 
 ## Testing
 
-**128 tests, 22 classes.** Run: `python3 -m pytest tests/ -q`
+**130 tests, 23 classes.** Run: `python3 -m pytest tests/ -q`
 
 | Class | Tests | What it covers |
 |---|---|---|
@@ -288,6 +288,7 @@ error" when the tool returns structured exit codes.
 | `TestBetaGate` | 3 | R13: `--beta` needs `--yes`; `--yes` and `--test` pass the gate |
 | `TestFailureTraceback` | 3 | R17: traceback kept, one frame by default, full chain under `--verbose` |
 | `TestFtpUploadOutcome` | 1 | R9: a failed `QUIT` must not discard a completed `STOR` |
+| `TestAsciiOutputPortability` | 2 | P1: operator-facing messages encode as ASCII; a partial upload under an ASCII stdout returns 7, not 1 |
 
 **Test infrastructure:**
 
@@ -298,6 +299,17 @@ error" when the tool returns structured exit codes.
 - Fixture data captured from a Brother HL-L2865DW printer
 - Custom mocks for `_snmp_walk_table` (async → sync table return) and
   `oh.time.sleep` (readiness and deadline paths — the fixed cooldown is gone)
+
+> ⚠️ **Never patch the stdlib `socket.socket` class.** The socket test helper
+> replaces the global class, and asyncio's event loop creates its self-pipe
+> with `socket.socketpair()` — which calls that same patched global. Under
+> pytest the self-pipe fds then become `MagicMock`s, `epoll.register` receives
+> a regular-file fd, and every `asyncio.run()` in `main()` dies with an
+> "Operation not permitted" `OSError`. The run returns `EXIT_PRINTER`
+> (4) before reaching the upload window, so a test written to exercise the
+> upload path can fail with a plausible-looking exit code for entirely
+> unrelated reasons. Patch a `SimpleNamespace` onto `oh.socket` instead —
+> leave the stdlib socket module untouched.
 
 > ⚠️ **pytest alone does not prove pysnmp works.** Because conftest replaces
 > pysnmp with a `MagicMock`, the suite reports a clean pass even with pysnmp

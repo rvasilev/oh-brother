@@ -2083,3 +2083,88 @@ class TestFailureTraceback:
 
         assert err.count('File "') >= 2      # full chain, not one frame
         assert 'raise ValueError("boom")' in err
+
+
+# ---------------------------------------------------------------------------
+# P1 — non-ASCII stdout must not launder the exit-code contract
+# ---------------------------------------------------------------------------
+
+class TestAsciiOutputPortability:
+    """Operator-facing output must survive a non-UTF-8 stdout.
+
+    U+2014 is unencodable in ascii/cp437/cp850/cp866/cp932/latin-1. When a
+    print() of a safety message raises UnicodeEncodeError it escapes the
+    per-window handlers and is caught by main()'s top-level `except
+    Exception`, turning EXIT_UPLOAD (7) into EXIT_ERROR (1) and replacing
+    the DO-NOT-POWER-OFF warning with a traceback.
+    """
+
+    def test_operator_messages_encode_as_ascii(self):
+        """Every operator-facing message builder is ASCII-printable."""
+        messages = [
+            oh._retained_message("D02FZM_124Q_crypt.djf"),
+            oh._incomplete_message("D02FZM_124Q_crypt.djf"),
+            oh._interrupt_during_upload("D02FZM_124Q_crypt.djf"),
+            oh._interrupt_during_verification("D02FZM_124Q_crypt.djf", "1.24"),
+        ]
+        for message in messages:
+            assert isinstance(message, str)
+            # Raises UnicodeEncodeError before the P1 fix.
+            message.encode("ascii")
+
+    def test_forced_upload_incomplete_survives_ascii_stdout(
+            self, monkeypatch, tmp_path):
+        """A partial upload under an ASCII stdout still returns 7, not 1."""
+        import io
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        async def fake_walk_cmd(*args, **kwargs):
+            return [[(str(oid), str(val)) for oid, val in row]
+                    for row in REAL_SNMP_TABLE]
+
+        # Replace only the module's socket namespace.  Patching the stdlib
+        # socket.socket *class* (as _fake_tcp_socket does) also breaks the
+        # socket.socketpair() that asyncio uses for its event-loop self-pipe,
+        # so main() never reaches the upload window.
+        sock = MagicMock()
+        sock.__enter__.return_value = sock
+        monkeypatch.setattr(oh, "socket", SimpleNamespace(
+            getaddrinfo=lambda *a, **k: [(2, 1, 6, '', ('1.2.3.4', 9100))],
+            socket=lambda *a: sock,
+            SOL_TCP=6,
+            timeout=TimeoutError,
+        ))
+
+        uploads = []
+
+        def fake_upload(filename, ip, sock_obj):
+            uploads.append(filename)
+            return oh.UPLOAD_INCOMPLETE
+
+        monkeypatch.setattr("builtins.input", lambda _=None: None)
+        monkeypatch.setattr(oh, "_snmp_walk_table", fake_walk_cmd)
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+        monkeypatch.setattr(oh, "_tcp_upload", fake_upload)
+        monkeypatch.chdir(tmp_path)
+
+        buffer = io.BytesIO()
+        ascii_stdout = io.TextIOWrapper(
+            buffer, encoding="ascii", errors="strict")
+        monkeypatch.setattr(sys, "stdout", ascii_stdout)
+        monkeypatch.setattr("sys.argv", ["oh-brother.py", "--yes", "1.2.3.4"])
+
+        code = oh.main()          # must not raise
+        ascii_stdout.flush()
+        out = buffer.getvalue().decode("ascii")
+
+        # Prove the fixture actually drove the upload path; a pass for any
+        # other reason would not exercise the defect.
+        assert uploads, "the upload window was never reached"
+        assert code == oh.EXIT_UPLOAD == 7
+        assert code != oh.EXIT_ERROR
+        assert "POWER OFF" in out
+        assert "Traceback" not in out
