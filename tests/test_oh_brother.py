@@ -1579,3 +1579,32 @@ class TestSnmpFailureClassification:
         assert code == oh.EXIT_PRINTER
         assert "within" in err
         assert elapsed < 5, "SNMP_DEADLINE did not cut the walk off"
+
+    def test_query_printer_version_tolerates_snmp_error(self, monkeypatch):
+        """A rebooting printer must yield None, not raise.
+
+        _verify_flash polls the printer while it is restarting, so SNMP
+        silence during that window is expected. If changing the walk from
+        sys.exit() to SnmpError broke this, a successful flash would be
+        reported as a failure - the exact false negative the verification
+        design exists to avoid.
+        """
+        async def silent(*a, **k):
+            raise oh.SnmpError("No SNMP response", oh.EXIT_PRINTER)
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", silent)
+
+        assert oh._query_printer_version("1.2.3.4", "public", "MAIN") is None
+
+    def test_verify_flash_unverified_when_printer_stays_silent(
+            self, monkeypatch):
+        """Still-silent at the deadline is 'unverified', never a failure."""
+        monkeypatch.setattr(oh, "FLASH_VERIFY_TIMEOUT", 0)
+        monkeypatch.setattr(oh, "FLASH_VERIFY_POLL", 0)
+        monkeypatch.setattr(oh, "_query_printer_version",
+                            lambda ip, community, cat: None)
+
+        status, actual = oh._verify_flash("1.2.3.4", "public", "MAIN", "1.24")
+
+        assert status == "unverified"
+        assert actual is None
