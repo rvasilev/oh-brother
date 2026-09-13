@@ -27,6 +27,7 @@ import re
 import asyncio
 import sys
 import io
+import hashlib
 import socket
 import ssl
 import os
@@ -124,6 +125,7 @@ FLASH_VERIFY_POLL = 5
 # working directory, which is the historical default.
 BACKUP_DIRNAME = 'firmware_backups'
 BACKUP_DIR_ENV = 'OH_BROTHER_BACKUP_DIR'
+SHA256_SUFFIX = '.sha256'
 
 # Download bounds. The largest image observed for this model is ~15 MB
 # (encrypted D02 firmware), so the hard cap is generous headroom rather than a
@@ -465,6 +467,83 @@ def _firmware_backup_path(model_name, version, filename):
     )
 
 
+def _sha256_file(path):
+    """Lowercase hex sha256 of a file, read in DOWNLOAD_CHUNK-sized blocks.
+
+    A digest recorded at retention time proves the retained file is bit-for-bit
+    the bytes that were verified, and lets a changed on-disk file or a changed
+    vendor artifact be detected. It cannot detect a corrupt download: the
+    vendor supplies no expected digest, only a declared Content-Length.
+    """
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        while True:
+            block = f.read(DOWNLOAD_CHUNK)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _sidecar_path(backup_path):
+    """Path of the digest record that accompanies a retained image."""
+    return backup_path + SHA256_SUFFIX
+
+
+def _write_sidecar(backup_path, digest):
+    """Record a retained image's digest in sha256sum format, atomically.
+
+    One line: '<digest>  <basename>\\n'. Two spaces is sha256sum's text-mode
+    separator, so `sha256sum -c <name>.sha256` works from the containing
+    directory. The line is written to a temporary sibling and renamed onto the
+    sidecar so a reader never sees a partial record. Raises OSError when the
+    record cannot be written; the caller decides what that means.
+    """
+    sidecar = _sidecar_path(backup_path)
+    tmp = sidecar + '.tmp'
+    try:
+        with open(tmp, 'w') as f:
+            f.write('%s  %s\n' % (digest, os.path.basename(backup_path)))
+        os.replace(tmp, sidecar)
+    except OSError:
+        _remove_quietly(tmp)
+        raise
+
+
+def _retained_copy_state(backup_path):
+    """Classify what is known about a retained image.
+
+    Returns (state, digest_or_None), where state is exactly one of:
+      'absent'     no retained file
+      'verified'   the file's digest matches the recorded digest
+      'unrecorded' the file exists but its digest is unknown (no sidecar, or a
+                   sidecar that cannot be read or parsed)
+      'corrupt'    a recorded digest exists and does not match the file
+
+    A malformed or unreadable sidecar is 'unrecorded', never 'corrupt': we do
+    not know, and that must not be promoted into a stronger claim.
+    """
+    if not os.path.exists(backup_path):
+        return 'absent', None
+    try:
+        actual = _sha256_file(backup_path)
+    except OSError:
+        return 'unrecorded', None
+    try:
+        with open(_sidecar_path(backup_path), 'r') as f:
+            fields = f.readline().split()
+    except OSError:
+        return 'unrecorded', None
+    if len(fields) != 2:
+        return 'unrecorded', None
+    recorded = fields[0].lower()
+    if len(recorded) != 64 or any(c not in '0123456789abcdef' for c in recorded):
+        return 'unrecorded', None
+    if recorded == actual:
+        return 'verified', actual
+    return 'corrupt', actual
+
+
 def _retained_message(path):
     """Operator-facing notice that the image survived a failed flash."""
     return (
@@ -772,6 +851,23 @@ def update_firmware(cat, version):
     print(e)
     return EXIT_DOWNLOAD
 
+  # Report what is already known about any retained copy. The digest records
+  # what was verified at retention time: it proves the retained file is the
+  # bytes that passed, and lets a changed on-disk file or a changed vendor
+  # artifact be detected below. It cannot detect a corrupt download, because
+  # the vendor supplies no expected digest -- only a declared length.
+  retained_state, retained_digest = _retained_copy_state(backup_path)
+  if retained_state == 'verified':
+    print('Retained image matches its recorded digest: %s'
+          % retained_digest[:12])
+  elif retained_state == 'corrupt':
+    print('WARNING: retained image does not match its recorded digest: %s'
+          % retained_digest[:12])
+  elif retained_state == 'unrecorded':
+    print('Retained image has no usable digest record; it cannot be trusted.')
+  else:
+    print('No retained image for this version.')
+
   # Download firmware
   print('Downloading firmware file %s from vendor server...' % filename)
   sys.stdout.flush()
@@ -856,12 +952,53 @@ def update_firmware(cat, version):
   # Promote the verified image into its retained recovery location. The file
   # was downloaded inside that directory, so this is normally a same-filesystem
   # rename; if it still fails, keep the verified image rather than deleting it.
+  #
+  # Compare the freshly downloaded bytes with what was verified last time first.
+  # Only a 'verified' retained copy can be compared; for anything else the
+  # digest is unknown and the new bytes are promoted unconditionally.
+  #
+  # Reading the partial back can fail (the file was deleted between the
+  # integrity check and here, or the disk failed). That is the same class of
+  # failure as a failed promote, so it reports the same way: EXIT_DOWNLOAD,
+  # and the verified image is named rather than deleted.
   try:
-    os.replace(part_filename, backup_path)
+    new_digest = _sha256_file(part_filename)
   except OSError as e:
-    print('Error: could not store firmware backup: %s' % e)
+    print('Error: could not re-read the downloaded firmware image: %s' % e)
     print('The verified image is still at: %s' % os.path.abspath(part_filename))
     return EXIT_DOWNLOAD
+  replace_needed = True
+  if retained_state == 'verified' and new_digest == retained_digest:
+    print('Vendor artifact is unchanged; the retained image is already these '
+          'exact bytes. Nothing rewritten.')
+    _remove_quietly(part_filename)
+    replace_needed = False
+  elif retained_state == 'verified':
+    print('WARNING: the vendor artifact for this version DIFFERS from the '
+          'retained copy.')
+    print('  retained digest: %s' % retained_digest)
+    print('  vendor digest:   %s' % new_digest)
+    print('Brother may have republished this version under the same filename; '
+          'the new bytes replace the retained image.')
+
+  if replace_needed:
+    try:
+      os.replace(part_filename, backup_path)
+    except OSError as e:
+      print('Error: could not store firmware backup: %s' % e)
+      print('The verified image is still at: %s' % os.path.abspath(part_filename))
+      return EXIT_DOWNLOAD
+    # Record the digest now that the bytes are in place. --test retains the
+    # image, so it must leave the same record behind as a flashing run. A record
+    # that cannot be written is not fatal: a missing record means "unknown", and
+    # the next run re-downloads and re-verifies. Never trade the image for it.
+    try:
+      _write_sidecar(backup_path, new_digest)
+    # aislop-ignore-next-line ai-slop/swallowed-exception -- the handler reports the failure; a missing record is fail-open and never costs the verified image.
+    except OSError as e:
+      print('WARNING: could not record the firmware digest at %s: %s'
+            % (_sidecar_path(backup_path), e))
+      print('The image is retained; the next run will re-download and re-verify.')
   filename = backup_path
 
   if args.test:

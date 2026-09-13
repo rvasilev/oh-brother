@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import os
 import sys
@@ -2321,3 +2322,244 @@ class TestBackupRootAndPartial:
 
         assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_DOWNLOAD
         assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
+
+
+# ---------------------------------------------------------------------------
+# Packet 3A (P4): the retained-copy digest record and change detection
+# ---------------------------------------------------------------------------
+
+ARTIFACT_124 = "D02FZM_124Q_crypt.djf"
+
+
+class TestRetainedCopyState:
+    """The retained copy is classified from its sidecar digest record.
+
+    ``_retained_copy_state`` distinguishes "the bytes on disk are the ones that
+    were verified" from "we do not know" and "they changed". A malformed or
+    unreadable sidecar is ``unrecorded``, never ``corrupt``: an absence of
+    knowledge must not be promoted into a claim. The sidecar suffix is written
+    as a literal here so a pre-fix run exercises the real path rather than dying
+    with an AttributeError on a symbol the fix introduces.
+    """
+
+    def _seed(self, tmp_path, body, sidecar=None):
+        backup = (tmp_path / "firmware_backups" / "HL-L2865DW" / "1.24"
+                  / ARTIFACT_124)
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        backup.write_bytes(body)
+        if sidecar is not None:
+            (backup.parent / (ARTIFACT_124 + ".sha256")).write_text(sidecar)
+        return str(backup)
+
+    def test_absent_when_no_file(self, tmp_path):
+        path = str(tmp_path / "firmware_backups" / "HL-L2865DW" / "1.24"
+                   / ARTIFACT_124)
+        assert oh._retained_copy_state(path) == ("absent", None)
+
+    def test_verified_when_recorded_digest_matches(self, tmp_path):
+        body = b"V" * 204800
+        digest = hashlib.sha256(body).hexdigest()
+        path = self._seed(tmp_path, body, "%s  %s\n" % (digest, ARTIFACT_124))
+        state, reported = oh._retained_copy_state(path)
+        assert state == "verified"
+        assert reported == digest
+
+    def test_unrecorded_when_sidecar_missing(self, tmp_path):
+        path = self._seed(tmp_path, b"V" * 204800)
+        assert oh._retained_copy_state(path) == ("unrecorded", None)
+
+    def test_unrecorded_when_sidecar_is_garbage(self, tmp_path):
+        path = self._seed(tmp_path, b"V" * 204800,
+                          "not a sha256sum line at all\n")
+        assert oh._retained_copy_state(path) == ("unrecorded", None)
+
+    def test_unrecorded_when_sidecar_digest_is_not_hex(self, tmp_path):
+        path = self._seed(tmp_path, b"V" * 204800,
+                          "%s  %s\n" % ("z" * 64, ARTIFACT_124))
+        assert oh._retained_copy_state(path) == ("unrecorded", None)
+
+    def test_corrupt_when_contents_replaced_under_the_sidecar(self, tmp_path):
+        body = b"V" * 204800
+        digest = hashlib.sha256(body).hexdigest()
+        path = self._seed(tmp_path, body, "%s  %s\n" % (digest, ARTIFACT_124))
+        with open(path, "wb") as f:
+            f.write(b"X" * 4096)
+
+        state, reported = oh._retained_copy_state(path)
+        assert state == "corrupt"
+        assert reported == hashlib.sha256(b"X" * 4096).hexdigest()
+        assert reported != digest
+
+
+class TestRetainedCopyChangeDetection:
+    """``update_firmware`` uses the recorded digest for reporting and change
+    detection only. It must never skip the download: a recorded hash is not
+    vendor corroboration (gate G2), so even a matching record still fetches.
+    """
+
+    def _arm(self, monkeypatch, tmp_path, body):
+        oh.args = _args(test=True)
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+        monkeypatch.delenv("OH_BROTHER_BACKUP_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+
+        downloads = []
+
+        def fake_urlopen(req, timeout=None):
+            from unittest.mock import MagicMock
+            downloads.append(req)
+            m = MagicMock()
+            m.headers = {"Content-Length": str(len(body))}
+            m.read.side_effect = [body, b""]
+            return m
+
+        monkeypatch.setattr(oh.urllib.request, "urlopen", fake_urlopen)
+        return downloads
+
+    def _backup(self, tmp_path):
+        return (tmp_path / "firmware_backups" / "HL-L2865DW" / "1.24"
+                / ARTIFACT_124)
+
+    def _sidecar(self, backup):
+        return backup.parent / (backup.name + ".sha256")
+
+    def test_corrupt_record_is_not_treated_as_known_good(
+            self, monkeypatch, tmp_path):
+        """G2: a wrong recorded hash must still cause a real re-download."""
+        fresh = b"B" * 204800
+        backup = self._backup(tmp_path)
+        backup.parent.mkdir(parents=True)
+        backup.write_bytes(b"old retained bytes")
+        self._sidecar(backup).write_text("%s  %s\n" % ("0" * 64, ARTIFACT_124))
+        downloads = self._arm(monkeypatch, tmp_path, fresh)
+
+        state, _ = oh._retained_copy_state(str(backup))
+        assert state == "corrupt"
+
+        result = oh.update_firmware("MAIN", "1.24")
+
+        assert len(downloads) == 1
+        assert result == oh.EXIT_OK
+        assert backup.read_bytes() == fresh
+
+    def test_sidecar_written_in_sha256sum_format(self, monkeypatch, tmp_path):
+        """Retention records one sha256sum-compatible line naming the basename."""
+        body = b"C" * 204800
+        self._arm(monkeypatch, tmp_path, body)
+
+        result = oh.update_firmware("MAIN", "1.24")
+
+        assert result == oh.EXIT_OK
+        backup = self._backup(tmp_path)
+        sidecar = self._sidecar(backup)
+        assert sidecar.exists()
+        expected = hashlib.sha256(body).hexdigest()
+        text = sidecar.read_text()
+        # sha256sum -c format: <digest><two spaces><basename><newline>.
+        assert text == "%s  %s\n" % (expected, ARTIFACT_124)
+        digest_field, name_field = text.split()
+        assert digest_field == expected
+        assert name_field == ARTIFACT_124
+        assert os.path.sep not in name_field
+
+    def test_unchanged_bytes_do_not_rewrite_the_retained_image(
+            self, monkeypatch, tmp_path, capsys):
+        """An identical vendor artifact leaves the file and its record alone."""
+        body = b"D" * 204800
+        backup = self._backup(tmp_path)
+        backup.parent.mkdir(parents=True)
+        backup.write_bytes(body)
+        expected = "%s  %s\n" % (hashlib.sha256(body).hexdigest(), ARTIFACT_124)
+        self._sidecar(backup).write_text(expected)
+        before = backup.stat()
+        downloads = self._arm(monkeypatch, tmp_path, body)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_OK
+        assert len(downloads) == 1
+        after = backup.stat()
+        assert (after.st_ino, after.st_mtime_ns) == (
+            before.st_ino, before.st_mtime_ns)
+        assert backup.read_bytes() == body
+        assert "DIFFERS" not in out
+        assert self._sidecar(backup).read_text() == expected
+
+    def test_changed_bytes_are_reported_and_promoted(
+            self, monkeypatch, tmp_path, capsys):
+        """A republished artifact under the same name is called out loudly."""
+        old = b"O" * 204800
+        new = b"N" * 204800
+        old_digest = hashlib.sha256(old).hexdigest()
+        new_digest = hashlib.sha256(new).hexdigest()
+        backup = self._backup(tmp_path)
+        backup.parent.mkdir(parents=True)
+        backup.write_bytes(old)
+        self._sidecar(backup).write_text(
+            "%s  %s\n" % (old_digest, ARTIFACT_124))
+        downloads = self._arm(monkeypatch, tmp_path, new)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_OK
+        assert len(downloads) == 1
+        assert old_digest in out
+        assert new_digest in out
+        assert "DIFFERS" in out
+        assert backup.read_bytes() == new
+        assert self._sidecar(backup).read_text() == (
+            "%s  %s\n" % (new_digest, ARTIFACT_124))
+
+    def test_sidecar_write_failure_keeps_the_image_and_exit_code(
+            self, monkeypatch, tmp_path, capsys):
+        """A record that cannot be written must never cost the image."""
+        body = b"F" * 204800
+        backup = self._backup(tmp_path)
+        backup.parent.mkdir(parents=True)
+        # A directory where the sidecar belongs makes the recording fail.
+        self._sidecar(backup).mkdir()
+        self._arm(monkeypatch, tmp_path, body)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_OK
+        assert backup.exists()
+        assert backup.read_bytes() == body
+        assert "could not record" in out
+        assert "sha256" in out
+        assert self._sidecar(backup).is_dir()
+        assert not list(backup.parent.glob("*.tmp"))
+
+    def test_unreadable_image_at_promote_is_exit_download_not_a_traceback(
+            self, monkeypatch, tmp_path, capsys):
+        """A read failure after verification reports the documented code.
+
+        ``_sha256_file`` runs twice on this path: once to classify the retained
+        copy, once to digest the freshly downloaded partial. Only the second
+        call may fail here, so the stand-in raises for the partial's path alone
+        and the retained copy still classifies normally.
+        """
+        body = b"G" * 204800
+        self._arm(monkeypatch, tmp_path, body)
+        real = oh._sha256_file
+
+        def flaky(path):
+            if str(path).endswith(".part"):
+                raise OSError("simulated read failure")
+            return real(path)
+
+        monkeypatch.setattr(oh, "_sha256_file", flaky)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_DOWNLOAD
+        assert "could not re-read" in out
+        # The image is named so it can be recovered -- never silently dropped.
+        assert ".part" in out
