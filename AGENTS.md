@@ -7,10 +7,10 @@
 Cross-platform Python 3 CLI to update Brother printer firmware. SNMP discovery → XML query to Brother's Japan server → HTTP download → TCP 9100 or FTP upload.
 
 - **Repo:** https://github.com/rvasilev/oh-brother
-- **Upstream:** https://github.com/CauldronDevelopmentLLC/oh-brother (commit `a9c8b10`)
+- **Upstream:** https://github.com/CauldronDevelopmentLLC/oh-brother (commit `a9c8b10`) — author Joseph Coffman. The GPLv2 header in the source is preserved byte-identical; changing it would be a licence breach, not a style nit.
 - **License:** GPLv2
-- **Lines:** 606, single file (`oh-brother.py`)
-- **Branch:** `master`
+- **Lines:** ~890, single file (`oh_brother.py`), installed as the `oh-brother` console script via `pyproject.toml`
+- **Branch:** `harden`
 
 ## Architecture
 
@@ -78,9 +78,9 @@ Module is import-safe: `if __name__ == '__main__':` guard.
 - **Procedural style** — pure functions, module-level globals (`args`, `model`, `spec`)
 - **No external HTTP libraries** — stdlib `urllib` only
 - **XML parsing** — stdlib `xml.etree.ElementTree`
-- **Firmware downloads** go to CWD — temp dir migration pending
+- **Firmware downloads** land as `<name>.part` in CWD, then are `os.replace()`d into `firmware_backups/<MODEL>/<version>/` (in CWD) after the integrity check
 - **Import-safe** — `if __name__ == '__main__':` guard
-- **Test imports** use `importlib.util.spec_from_file_location` (filename has hyphen)
+- **Test imports** use `importlib.util.spec_from_file_location` (loaded by file path; the module is `oh_brother.py`)
 
 ## Safety features
 
@@ -91,12 +91,15 @@ Module is import-safe: `if __name__ == '__main__':` guard.
 | Sendfile retry | `_tcp_upload()` | Short TCP writes (offset retry loop), connection drops (zero-return detection) |
 | Upload cooldown | `main()` loop | Printer reboot race when multiple firmwares pending (30s delay) |
 | HTTP error handling | `_http_post()` / `_http_request()` | 503/504 server errors, SSL cert failures, timeouts, DNS errors |
-| Socket timeout | `sock.settimeout(60)` | Indefinite TCP upload hangs |
+| Upload socket budget | `UPLOAD_SOCKET_TIMEOUT` (300s) + byte-progress accounting | Indefinite TCP upload hangs. The 60s predecessor bounded the whole `sendfile()` call, not each packet, so a throttling printer aborted a flash mid-write. A timeout *after* bytes were accepted is `UPLOAD_INCOMPLETE` — retained, never a silent failure |
+| FTP timeout | `FTP_TIMEOUT` (30s) | `storbinary` blocking forever |
+| Image retention | `_firmware_backup_path()`, `_retained_message()` | Losing the only copy of an image needed to retry. Downloads land in `<name>.part` and are `os.replace()`d into `firmware_backups/<MODEL>/<version>/` only after the integrity check; nothing is left under a real firmware name and the image is deleted only after a verified flash |
+| Post-flash verification | `_verify_flash()` | Trusting "the socket did not raise". TCP 9100 is fire-and-forget — a completed write is not an accepted image |
 
 ## CLI reference
 
 ```
-./oh-brother.py [OPTIONS] <printer IP>
+./oh_brother.py [OPTIONS] <printer IP>
 
   -t, --test       Check firmware availability (no upload)
   -c, --category   Force a specific firmware category (MAIN, SUB1, etc.)
@@ -107,42 +110,91 @@ Module is import-safe: `if __name__ == '__main__':` guard.
   -p, --password   Upload via FTP using printer admin password
   -C, --community  SNMP community string (default: public)
   -y, --yes        Skip all confirmation prompts (non-interactive mode)
+  --reflash        Re-apply the current version even when the printer reports it
+                   as up to date. Also what makes `--test` fetch a backup.
+  --version        Print the installed version (from package metadata)
 ```
+
+## Flashing gates (default-deny)
+
+The tool never attempts an upload without explicit intent. All of these are
+enforced *before* a socket is opened.
+
+| Gate | Behaviour when not satisfied |
+|---|---|
+| `VERSIONCHECK=1` (already current) | Terminal. No download, no upload, exit 3. `--reflash` opts back in. |
+| stdin is not a TTY and `--yes` absent | Exit 9 (REFUSED) — a cron job cannot silently reflash. Checked before the download, so a refusal does not waste a 15 MB fetch. |
+| Artifact version older than installed | Exit 9. There is deliberately **no** `--allow-downgrade` flag; for a printer whose firmware is the vendor's database of record, a downgrade is never the right call. |
+| Artifact version unparseable | Warns loudly and proceeds — a downgrade cannot be proven. |
+| Model/spec mismatch, or bad firmware host | Exit 5. The host check compares domain *labels*, not string suffixes. |
+
+## Exit-code contract
+
+Constants at the top of the module. `main()` aggregates worst-wins — an upload
+failure is never hidden behind another category's success — and prints
+`FAILURE: ...` for anything that is not OK/CURRENT.
+
+| Code | Constant | Meaning |
+|---|---|---|
+| 0 | `EXIT_OK` | Uploaded and verified, or `--test` fetched and verified an image |
+| 1 | `EXIT_ERROR` | Unexpected internal error |
+| 2 | `EXIT_USAGE` | Bad arguments |
+| 3 | `EXIT_CURRENT` | Printer already current — the healthy cron no-op |
+| 4 | `EXIT_PRINTER` | Printer unreachable |
+| 5 | `EXIT_VENDOR` | Brother API error / no firmware URL |
+| 6 | `EXIT_DOWNLOAD` | Download or integrity check failed |
+| 7 | `EXIT_UPLOAD` | Upload failed, rejected, or version mismatch |
+| 8 | `EXIT_UNVERIFIED` | Uploaded but the printer did not come back in time |
+| 9 | `EXIT_REFUSED` | A safety gate declined |
+
+**Code 8 is not a failure.** A Brother laser reboots for 60–120 s after a flash,
+and reporting a false FAILED there is how people end up reflashing a printer
+that is already working. `_verify_flash()` returns `ok`/`mismatch`/`unverified`;
+an unparseable expected version yields `unverified`, not a false `mismatch`.
 
 ## Testing
 
-**74 tests, 11 classes.** Run: `python3 -m pytest tests/ -v`
+**91 tests, 13 classes.** Run: `python3 -m pytest tests/ -q`
 
 | Class | Tests | What it covers |
 |---|---|---|
-| `TestParseSnmpTable` | 7 | Real printer data, multi-FW, ordering edge cases, empty table, verbose |
-| `TestBuildFirmwareXml` | 6 | XML structure, FIRM→MAIN mapping, IFAX→MAIN mapping, beta flag, bytes output |
-| `TestParseBrotherResponse` | 5 | Up-to-date, update available, no PATH, no VERSIONCHECK, empty response |
-| `TestCLI` | 7 (parameterized) | All boolean flags, string args, category+version combo, IP required |
-| `TestMainSmoke` | 6 | SNMP pipeline, model override, category override, SNMP errors, multi-FW cooldown |
-| `TestUpdateFirmware` | 5 + 1 skip | VCHECK=1, no-PATH, --yes skip, fallback succeed/fail |
-| `TestDecrementVersion` | 5 | Normal, zero minor, 3-part, non-numeric, empty |
+| `TestCLI` | 19 (parameterized) | All boolean flags, string args, category+version combo, IP required, `--reflash` |
+| `TestSafetyGates` | 9 | Default-deny: already-current terminal, non-TTY refusal, downgrade refusal, no-override-flag |
 | `TestValidateFirmwareUrl` | 8 | Valid HTTP/HTTPS, .upd, wrong domain, file://, wrong ext, empty, query params |
-| `TestTcpUpload` | 3 | Full sendfile, short-write retry, zero-return failure |
+| `TestParseSnmpTable` | 7 | Real printer data, multi-FW, ordering edge cases, empty table, verbose |
+| `TestFlashHardening` | 7 | Tri-state upload, image retention, partial-file promotion, post-flash verify |
+| `TestUpdateFirmware` | 6 | VCHECK=1, no-PATH, `--yes` skip, fallback succeed/fail, `--test` stops before upload |
+| `TestMainSmoke` | 6 | SNMP pipeline, model override, category override, SNMP errors, multi-FW cooldown |
+| `TestBuildFirmwareXml` | 6 | XML structure, FIRM→MAIN mapping, IFAX→MAIN mapping, beta flag, bytes output |
 | `TestVerifyFirmwareIntegrity` | 5 | Content-Length match/mismatch, too small, minimum pass, size-only |
+| `TestParseBrotherResponse` | 5 | Up-to-date, update available, no PATH, no VERSIONCHECK, empty response |
 | `TestHttpPost` | 5 | Success, HTTP 503, SSL cert error, timeout, DNS failure |
+| `TestDecrementVersion` | 5 | Normal, zero minor, 3-part, non-numeric, empty |
+| `TestTcpUpload` | 3 | Full sendfile, short-write retry, zero-return failure |
 
 **Test infrastructure:**
 - `tests/conftest.py` — mocks `pysnmp`, `pysnmp.hlapi`, `pysnmp.hlapi.v1arch` at `sys.modules` level
-- `tests/test_oh_brother.py` — imports module via `importlib.util` (filename has hyphen)
+
+> ⚠️ **pytest alone does not prove pysnmp works.** Because conftest replaces
+> pysnmp with a `MagicMock`, the suite reports a clean pass even with pysnmp
+> entirely absent. CI therefore also runs, *outside* pytest, both
+> `oh-brother --version` and `python -c "from pysnmp.hlapi.v1arch import walk_cmd"`.
+> Keep that step: it is what turns a future pysnmp 8.x rename into a red build
+> instead of a failure at a user's printer at 3am.
+
+- `tests/test_oh_brother.py` — imports module via `importlib.util` (loaded by file path)
 - Fixture data captured from a Brother HL-L2865DW printer
-- `test_test_flag_stops_before_upload` is skipped — HTTP download mocking needs deeper `urllib.request` interception
 - Custom mocks for `_snmp_walk_table` (async → sync table return) and `time.sleep` (cooldown verification)
 
 ```bash
 # Full test run
-python3 -m pytest tests/ -v
+python3 -m pytest tests/ -q
 
 # With coverage
-python3 -m pytest tests/ --cov=oh-brother.py --cov-report=term-missing
+python3 -m pytest tests/ --cov=oh_brother.py --cov-report=term-missing
 
-# Real printer integration test
-python3 oh-brother.py --test --yes <printer IP>
+# Real printer integration test (safe: downloads + retains, never uploads)
+python3 oh_brother.py --test --reflash <printer IP>
 ```
 
 ## pysnmp migration (completed)

@@ -21,6 +21,7 @@ from pysnmp.hlapi.v1arch import (
 import urllib.request, urllib.error, urllib.parse
 import xml.etree.ElementTree as ET
 import argparse
+from importlib.metadata import version as _dist_version, PackageNotFoundError
 import re
 import asyncio
 import sys
@@ -183,6 +184,13 @@ def parse_brother_response(xml_bytes):
     
     return {'version_check': version_check, 'firmware_url': firmware_url}
 
+
+def _version():
+    try:
+        return _dist_version("oh-brother")
+    except PackageNotFoundError:
+        return "0.0.0+source"
+
 # Parse args
 usage = '%(prog)s [OPTIONS] <printer IP address>'
 description = 'A platform independent tool for updating Brother firmwares'
@@ -214,6 +222,8 @@ parser.add_argument('-y', '--yes', action = 'store_true',
 parser.add_argument('--reflash', action = 'store_true',
                     help = 'Re-apply the current firmware version even when the '
                     'printer already reports it as up to date')
+parser.add_argument('--version', action = 'version',
+                    version = '%(prog)s ' + _version())
 
 
 def prompt(msg):

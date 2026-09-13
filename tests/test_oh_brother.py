@@ -4,8 +4,8 @@ import sys
 import xml.etree.ElementTree as ET
 import pytest
 
-# Import oh-brother.py (filename has a hyphen, not directly importable)
-module_path = os.path.join(os.path.dirname(__file__), '..', 'oh-brother.py')
+# Import oh_brother.py by path
+module_path = os.path.join(os.path.dirname(__file__), '..', 'oh_brother.py')
 spec = importlib.util.spec_from_file_location("oh_brother", module_path)
 oh = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(oh)
@@ -501,15 +501,14 @@ class TestUpdateFirmware:
         result = oh.update_firmware("MAIN", "1.24")
         assert result == oh.EXIT_VENDOR
 
-    @pytest.mark.skip(reason="update_firmware HTTP mocking needs deeper integration — real urlopen intercepts")
     def test_test_flag_stops_before_upload(self, monkeypatch, tmp_path):
-        """--test downloads firmware but does not upload."""
+        """--test downloads firmware but does not upload; image is retained."""
         from unittest.mock import MagicMock
         from types import SimpleNamespace
 
         oh.args = SimpleNamespace(
             beta=False, verbose=False, test=True, yes=False,
-            ip="1.2.3.4", password=None,
+            ip="1.2.3.4", password=None, reflash=False,
         )
         oh.model = "HL-L2865DW"
         oh.spec = "0906"
@@ -524,23 +523,32 @@ class TestUpdateFirmware:
             b'</RESPONSEINFO>'
         )
 
-        call_count = [0]
+        body = b"F" * 200000
 
-        def mock_urlopen(req, timeout=None):
-            call_count[0] += 1
+        def fake_urlopen(req, timeout=None):
             m = MagicMock()
-            if call_count[0] == 1:
-                m.read.return_value = xml_update
-            else:
-                m.read.return_value = b"fake firmware data"
+            m.headers = {'Content-Length': str(len(body))}
+            m.read.side_effect = [body, b'']
             return m
 
-        monkeypatch.setattr(oh.urllib.request, "urlopen", mock_urlopen)
-        monkeypatch.setattr("builtins.input", lambda _=None: None)
+        def fail_socket(*args, **kwargs):
+            raise AssertionError("no socket may be created in --test mode")
+
+        monkeypatch.setattr(
+            oh, '_http_post',
+            lambda url, data, hdrs, timeout=30: (xml_update, None))
+        monkeypatch.setattr(oh.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(oh.socket, "getaddrinfo", fail_socket)
+        monkeypatch.setattr(oh.socket, "socket", fail_socket)
         monkeypatch.chdir(tmp_path)
 
         result = oh.update_firmware("MAIN", "1.24")
-        assert result is False
+
+        assert result == oh.EXIT_OK
+        retained = list((tmp_path / oh.BACKUP_DIRNAME).rglob("*.djf"))
+        assert len(retained) == 1
+        assert retained[0].stat().st_size == len(body)
+        assert not list(tmp_path.rglob("*.part"))
 
     def test_yes_skips_prompts(self, monkeypatch):
         """--yes flag skips all input() prompts."""

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oh-brother"
+version = "0.3.0"
+description = "Cross-platform tool for updating Brother printer firmware"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-2.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "Joseph Coffman" }]
+maintainers = [{ name = "Roman Vasilev" }]
+dependencies = ["pysnmp>=7.1.0,<8"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/rvasilev/oh-brother"
+Upstream = "https://github.com/CauldronDevelopmentLLC/oh-brother"
+
+[project.scripts]
+oh-brother = "oh_brother:main"
+
+[tool.setuptools]
+py-modules = ["oh_brother"]
