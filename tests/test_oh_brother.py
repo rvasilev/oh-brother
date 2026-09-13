@@ -1518,3 +1518,64 @@ class TestSnmpFailureClassification:
 
         assert code == oh.EXIT_ERROR == 1
         assert code != oh.EXIT_PRINTER
+
+    def test_snmp_transport_uses_bounded_timeout_and_retries(self, monkeypatch):
+        """The transport must state its budget, not inherit pysnmp's.
+
+        pysnmp defaults to timeout=1, retries=5. The original code passed
+        only timeout=30, so an unreachable printer cost 30*(5+1) = 180s.
+        """
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        captured = {}
+
+        async def fake_create(address, *a, **k):
+            captured["address"] = address
+            captured.update(k)
+            return MagicMock()
+
+        async def empty_walk(*a, **k):
+            for row in ():
+                yield row
+
+        monkeypatch.setattr(oh, "UdpTransportTarget",
+                            SimpleNamespace(create=fake_create))
+        monkeypatch.setattr(oh, "walk_cmd", empty_walk)
+        monkeypatch.setattr(oh, "SnmpDispatcher", lambda: None)
+        monkeypatch.setattr(oh, "CommunityData", lambda *a, **k: None)
+        monkeypatch.setattr(oh, "ObjectType", lambda *a: None)
+        monkeypatch.setattr(oh, "ObjectIdentity", lambda *a: None)
+
+        asyncio.run(oh._snmp_walk_table("1.2.3.4", "public", "1.2.3.4"))
+
+        assert captured["address"] == ("1.2.3.4", 161)
+        assert captured["timeout"] == oh.SNMP_TIMEOUT == 5
+        assert captured["retries"] == oh.SNMP_RETRIES == 1
+        # The regression was retries silently defaulting to 5.
+        assert captured["retries"] < 5
+        # Worst case per request must be well under the old three minutes.
+        assert captured["timeout"] * (captured["retries"] + 1) <= 15
+
+    def test_snmp_stage_is_bounded_by_a_deadline(self, monkeypatch, capsys):
+        """A walk that never returns is cut off, reported as exit 4."""
+        import asyncio
+        import time
+
+        monkeypatch.setattr(oh, "SNMP_DEADLINE", 0.05)
+
+        async def hangs(*a, **k):
+            await asyncio.sleep(30)
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", hangs)
+        monkeypatch.setattr("sys.argv", ["oh-brother.py", "--yes", "1.2.3.4"])
+
+        started = time.monotonic()
+        code = oh.main()
+        elapsed = time.monotonic() - started
+        err = capsys.readouterr().err
+
+        assert code == oh.EXIT_PRINTER
+        assert "within" in err
+        assert elapsed < 5, "SNMP_DEADLINE did not cut the walk off"

@@ -150,6 +150,11 @@ An unreachable printer is reported as **4**. That covers both the SNMP stage
 connection on the firmware port. It never means "the printer rejected the
 image" — that is **7**.
 
+That failure is also bounded. SNMP gives up after about ten seconds (5s per
+request, one retry, with a 30s ceiling on the whole discovery stage), so a
+printer that is simply switched off reports **4** promptly instead of hanging
+for minutes. This matters if you drive the tool from cron.
+
 # How to use it
 
 You need to know both the IP address of your printer, and the *admin* password

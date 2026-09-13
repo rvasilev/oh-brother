@@ -92,6 +92,18 @@ UPLOAD_SOCKET_TIMEOUT = 300       # bounds one sendfile() call
 UPLOAD_STALL_DEADLINE = 3600      # bounds the whole transfer
 FTP_TIMEOUT = 30                  # bounds a hung FTP session
 
+# SNMP discovery budget (seconds).
+#
+# pysnmp's transport defaults to timeout=1, retries=5, and the walk inherits
+# them. Passing only timeout=30 left retries at 5, so an unreachable printer
+# cost 30 * (5 + 1) = 180s before it failed — three minutes of nothing on the
+# most common failure path, which is no use to anything running unattended.
+# A printer on a LAN answers in milliseconds, so one retry is ample, and
+# SNMP_DEADLINE bounds the whole stage so it can never stall indefinitely.
+SNMP_TIMEOUT = 5
+SNMP_RETRIES = 1
+SNMP_DEADLINE = 30
+
 # Post-flash verification window (seconds). A Brother laser reboots after a
 # flash and SNMP is typically unavailable for 60-120 seconds.
 FLASH_VERIFY_TIMEOUT = 300
@@ -842,7 +854,7 @@ async def _snmp_walk_table(ip, community, oid):
     Raises SnmpError on SNMP errors.
     """
     transport = await UdpTransportTarget.create(
-        (ip, 161), timeout=30
+        (ip, 161), timeout=SNMP_TIMEOUT, retries=SNMP_RETRIES,
     )
     table = []
     async for errorIndication, errorStatus, errorIndex, varBinds in walk_cmd(
@@ -893,8 +905,9 @@ def main() -> int:
         sys.stdout.flush()
 
         try:
-            table = asyncio.run(_snmp_walk_table(
-                args.ip, args.community, BROTHER_SNMP_OID,
+            table = asyncio.run(asyncio.wait_for(
+                _snmp_walk_table(args.ip, args.community, BROTHER_SNMP_OID),
+                SNMP_DEADLINE,
             ))
         except SnmpError as e:
             # An off or unreachable printer is the single most common way
@@ -902,6 +915,13 @@ def main() -> int:
             # being reported as an internal error.
             print(str(e), file=sys.stderr)
             return e.exit_code
+        except (TimeoutError, asyncio.TimeoutError):
+            # asyncio.TimeoutError is an alias of TimeoutError on 3.11+;
+            # listing both keeps this correct on 3.10 as well.
+            print('No SNMP response from %s within %ds. The printer may be '
+                  'off, on a different address, or have SNMP disabled.'
+                  % (args.ip, SNMP_DEADLINE), file=sys.stderr)
+            return EXIT_PRINTER
         except OSError as e:
             print('Cannot reach the printer at %s:161 — %s' % (args.ip, e),
                   file=sys.stderr)
