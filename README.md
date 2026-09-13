@@ -123,6 +123,7 @@ Exit codes are a stable contract for scripting:
 | 7 | UPLOAD — upload failed, printer rejected the image, or the version did not match |
 | 8 | UNVERIFIED — uploaded, but the printer did not come back in time to confirm |
 | 9 | REFUSED — a safety gate declined to proceed |
+| 130 | INTERRUPTED — you pressed Ctrl-C outside the upload window (shell SIGINT convention) |
 
 Exit code **8 is deliberately not a failure**: a Brother laser reboots for a
 minute or two after a flash, and reporting a false failure there is how people
@@ -132,6 +133,22 @@ reacting to an 8. Anything at 7 or 9 needs a human.
 If a transfer is interrupted mid-write the tool keeps the image and prints
 `TRANSFER INCOMPLETE — DO NOT POWER OFF; reflash from <path>`. Heed it. The
 retained image under `firmware_backups/` is what you retry from.
+
+Pressing Ctrl-C is handled explicitly rather than allowed to dump a traceback:
+
+  * **during the upload** the printer may be holding a partial image, so it
+    prints a `DO NOT TURN THE PRINTER OFF` warning, keeps the image, and exits
+    **7** — never a stack trace;
+  * **during the post-flash check** the upload already succeeded and the
+    printer is rebooting, so it exits **8** (uploaded, unconfirmed) rather than
+    claiming a success it never verified;
+  * **anywhere else** nothing was half-written on the printer, so it exits
+    **130**, the shell convention for SIGINT.
+
+An unreachable printer is reported as **4**. That covers both the SNMP stage
+(the printer is off, on the wrong address, or has SNMP disabled) and a refused
+connection on the firmware port. It never means "the printer rejected the
+image" — that is **7**.
 
 # How to use it
 

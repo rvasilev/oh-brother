@@ -1321,3 +1321,200 @@ class TestFlashHardening:
         assert "could not be verified" in out
         assert "FAILURE" not in out
         assert list(tmp_path.rglob("*.djf"))  # retained
+
+
+# ---------------------------------------------------------------------------
+# Interrupt handling (R19) and printer-unreachable classification (R15)
+# ---------------------------------------------------------------------------
+
+def _prepare_flash(monkeypatch, tmp_path):
+    """Point update_firmware at a valid API response and a fake download."""
+    oh.args = _args()
+    oh.model = "HL-L2865DW"
+    oh.spec = "0906"
+    monkeypatch.setattr(oh, "_http_post",
+                        lambda *a, **k: (XML_UPDATE_124, None))
+    monkeypatch.setattr(oh.urllib.request, "urlopen",
+                        lambda *a, **k: _download_response())
+    monkeypatch.chdir(tmp_path)
+
+
+class TestInterruptHandling:
+    """A Ctrl-C must never brick a printer nor escape as a traceback."""
+
+    def test_ctrl_c_during_upload_warns_and_retains_image(
+            self, monkeypatch, tmp_path, capsys):
+        """Interrupted mid-transfer: loud warning, image kept, exit 7."""
+        _prepare_flash(monkeypatch, tmp_path)
+
+        def interrupt(f, ip, sock):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(oh, "_tcp_upload", interrupt)
+        _fake_tcp_socket(monkeypatch)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_UPLOAD
+        assert "INTERRUPTED DURING UPLOAD" in out
+        assert "DO NOT TURN THE PRINTER OFF" in out
+        assert "Traceback" not in out
+        # The recovery image is the whole point of retaining it.
+        assert len(list(tmp_path.rglob("*.djf"))) == 1
+
+    def test_ctrl_c_during_verification_is_not_a_success(
+            self, monkeypatch, tmp_path, capsys):
+        """Interrupted during the confirm poll: UNVERIFIED, never exit 0."""
+        _prepare_flash(monkeypatch, tmp_path)
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, sock: True)
+        _fake_tcp_socket(monkeypatch)
+
+        def interrupt(*a, **k):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(oh, "_verify_flash", interrupt)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_UNVERIFIED
+        assert result != oh.EXIT_OK
+        assert "NOT confirmed" in out
+        assert "Traceback" not in out
+        assert list(tmp_path.rglob("*.djf"))  # retained, not deleted
+
+    def test_ctrl_c_during_snmp_exits_cleanly(self, monkeypatch, capsys):
+        """A Ctrl-C before the upload window is a clean 130."""
+        async def interrupted_walk(*a, **k):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", interrupted_walk)
+        monkeypatch.setattr("builtins.input", lambda _=None: None)
+        monkeypatch.setattr("sys.argv", ["oh-brother.py", "--yes", "1.2.3.4"])
+
+        code = oh.main()
+        out = capsys.readouterr().out
+
+        assert code == oh.EXIT_INTERRUPTED == 130
+        assert "Interrupted." in out
+        assert "Traceback" not in out
+
+
+class TestPrinterUnreachable:
+    """R15: an unresolvable or refusing printer is exit 4, not exit 1."""
+
+    def test_unresolvable_host_returns_exit_printer(
+            self, monkeypatch, tmp_path, capsys):
+        _prepare_flash(monkeypatch, tmp_path)
+
+        def no_resolve(*a, **k):
+            raise oh.socket.gaierror("Name or service not known")
+
+        monkeypatch.setattr(oh.socket, "getaddrinfo", no_resolve)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_PRINTER == 4
+        assert "Cannot reach the printer" in out
+        # Nothing reached the printer, so the image must be kept.
+        assert list(tmp_path.rglob("*.djf"))
+
+    def test_refused_connection_returns_exit_printer(
+            self, monkeypatch, tmp_path, capsys):
+        from unittest.mock import MagicMock
+
+        _prepare_flash(monkeypatch, tmp_path)
+
+        sock = MagicMock()
+        sock.connect.side_effect = ConnectionRefusedError("Connection refused")
+        monkeypatch.setattr(
+            oh.socket, "getaddrinfo",
+            lambda *a, **k: [(2, 1, 6, '', ('1.2.3.4', 9100))])
+        monkeypatch.setattr(oh.socket, "socket", lambda *a: sock)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_PRINTER
+        assert "Cannot reach the printer" in out
+        # A socket that never connected must not be leaked.
+        assert sock.close.called
+
+    def test_upload_failure_after_connect_is_still_exit_upload(
+            self, monkeypatch, tmp_path, capsys):
+        """Connectivity (4) and rejection (7) must stay distinguishable."""
+        _prepare_flash(monkeypatch, tmp_path)
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, sock: False)
+        _fake_tcp_socket(monkeypatch)
+
+        result = oh.update_firmware("MAIN", "1.24")
+
+        assert result == oh.EXIT_UPLOAD
+        assert result != oh.EXIT_PRINTER
+
+
+class TestSnmpFailureClassification:
+    """An off or SNMP-disabled printer must report PRINTER (4), not ERROR (1).
+
+    This was a sibling of the R15 flaw: _snmp_walk_table called sys.exit(1),
+    so the most common real-world failure ("printer is off") reported an
+    internal error and the documented exit code 4 was unreachable.
+    """
+
+    def test_walk_raises_snmp_error_on_no_response(self, monkeypatch):
+        """The walk must raise, not kill the process with sys.exit()."""
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        async def fake_walk(*a, **k):
+            yield ("RequestTimedOut", None, None, [])
+
+        monkeypatch.setattr(oh, "walk_cmd", fake_walk)
+        monkeypatch.setattr(
+            oh, "UdpTransportTarget",
+            SimpleNamespace(create=AsyncMock(return_value=None)))
+        monkeypatch.setattr(oh, "SnmpDispatcher", lambda: None)
+        monkeypatch.setattr(oh, "CommunityData", lambda *a, **k: None)
+        monkeypatch.setattr(oh, "ObjectType", lambda *a: None)
+        monkeypatch.setattr(oh, "ObjectIdentity", lambda *a: None)
+
+        with pytest.raises(oh.SnmpError) as excinfo:
+            asyncio.run(oh._snmp_walk_table("1.2.3.4", "public", "1.2.3.4"))
+
+        assert excinfo.value.exit_code == oh.EXIT_PRINTER == 4
+        assert "No SNMP response" in str(excinfo.value)
+
+    def test_no_snmp_response_maps_to_exit_printer(self, monkeypatch, capsys):
+        """main() surfaces the walk's code, so 'printer off' exits 4."""
+        async def no_response(*a, **k):
+            raise oh.SnmpError(
+                "No SNMP response from 1.2.3.4 (RequestTimedOut).",
+                oh.EXIT_PRINTER)
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", no_response)
+        monkeypatch.setattr("sys.argv", ["oh-brother.py", "--yes", "1.2.3.4"])
+
+        code = oh.main()
+        err = capsys.readouterr().err
+
+        assert code == oh.EXIT_PRINTER == 4
+        assert "No SNMP response" in err
+
+    def test_snmp_protocol_error_stays_exit_error(self, monkeypatch, capsys):
+        """A printer that answers but errors is not 'unreachable'."""
+        async def bad_response(*a, **k):
+            raise oh.SnmpError(
+                "SNMP error reading the printer: noSuchName at 1.2.3.4",
+                oh.EXIT_ERROR)
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", bad_response)
+        monkeypatch.setattr("sys.argv", ["oh-brother.py", "--yes", "1.2.3.4"])
+
+        code = oh.main()
+        err = capsys.readouterr().err
+
+        assert code == oh.EXIT_ERROR == 1
+        assert code != oh.EXIT_PRINTER

@@ -78,6 +78,7 @@ EXIT_DOWNLOAD   = 6
 EXIT_UPLOAD     = 7
 EXIT_UNVERIFIED = 8
 EXIT_REFUSED    = 9
+EXIT_INTERRUPTED = 130    # Ctrl-C outside the upload window (shell SIGINT convention)
 
 # Upload outcome classification (see _tcp_upload / update_firmware).
 # A boolean True still means a clean transfer; UPLOAD_INCOMPLETE marks a
@@ -416,6 +417,34 @@ def _incomplete_message(path):
             % os.path.abspath(path))
 
 
+def _interrupt_during_upload(path):
+    """Wording matters more here than anywhere else in the tool.
+
+    Ctrl-C while the image is being written can leave a partial image in
+    the printer's flash, so the operator must be told plainly not to cut
+    power and how to recover.
+    """
+    return (
+        '!! INTERRUPTED DURING UPLOAD — DO NOT TURN THE PRINTER OFF !!\n'
+        'The printer may have received only part of the firmware image, and\n'
+        'a printer that loses power mid-flash can be left unusable.\n'
+        'Wait a minute or two, then re-run this tool to send a complete\n'
+        'image.\n'
+        + _retained_message(path)
+    )
+
+
+def _interrupt_during_verification(path, expected):
+    """The upload already succeeded; only confirmation was abandoned."""
+    return (
+        'Upload finished, so the printer is rebooting now. That is safe,\n'
+        'but the result was NOT confirmed (expected version %s).\n'
+        'Wait a minute or two, then re-run this tool to confirm — do not\n'
+        'reflash blindly. Image retained at: %s'
+        % (expected, os.path.abspath(path))
+    )
+
+
 def _query_printer_version(ip, community, cat):
     """Read one firmware category's version with a single SNMP walk.
 
@@ -695,34 +724,58 @@ def update_firmware(cat, version):
   if not args.yes:
     prompt('Press Ctrl-C to prevent upgrade or Enter to continue...')
 
-  # Upload firmware to printer
+  # Upload firmware to printer.
+  #
+  # From here until the transfer is acknowledged the printer may be holding a
+  # partial image, so a Ctrl-C in this window is not a harmless abort: it has
+  # to be caught and explained rather than allowed to escape as a traceback.
   print('Now uploading firmware to printer (DO NOT REMOVE POWER!)...')
   sys.stdout.flush()
 
   upload_result = UPLOAD_FAILED
-  if args.password is None:
-    ai = socket.getaddrinfo(args.ip, 9100, proto=socket.SOL_TCP)[0]
-    try:
-      with socket.socket(ai[0], ai[1], ai[2]) as sock:
-        sock.settimeout(UPLOAD_SOCKET_TIMEOUT)
-        sock.connect(ai[4])
-        upload_result = _tcp_upload(filename, args.ip, sock)
+  try:
+    if args.password is None:
+      # Resolve and connect before the transfer. Failing here means the
+      # printer is unreachable — a different diagnosis, and a different exit
+      # code, from an image the printer refused.
+      try:
+        ai = socket.getaddrinfo(args.ip, 9100, proto=socket.SOL_TCP)[0]
+        sock = socket.socket(ai[0], ai[1], ai[2])
+        try:
+          sock.settimeout(UPLOAD_SOCKET_TIMEOUT)
+          sock.connect(ai[4])
+        except OSError:
+          sock.close()
+          raise
+      except OSError as e:
+        print('Cannot reach the printer at %s:9100 — %s' % (args.ip, e))
+        print(_retained_message(filename))
+        return EXIT_PRINTER
 
-    except OSError as e:
-      print('Firmware update aborted due to error while uploading')
-      print(e)
-  else:
-    try:
-      ftp = FTP(args.ip, user = args.password, timeout = FTP_TIMEOUT) # Yes send password as user
-      with open(filename, 'rb') as fw:
-        ftp.storbinary('STOR ' + os.path.basename(filename), fw)
-      ftp.quit()
-      # A completed STOR proves the transfer only, not that the printer
-      # accepted the image; the verification step below is authoritative.
-      upload_result = UPLOAD_OK
-    except all_errors as e:
-      print('Firmware update aborted due to error while uploading')
-      print(e)
+      # The printer is listening, so past this point a failure is an upload
+      # failure rather than a connectivity problem.
+      try:
+        with sock:
+          upload_result = _tcp_upload(filename, args.ip, sock)
+      except OSError as e:
+        print('Firmware update aborted due to error while uploading')
+        print(e)
+    else:
+      try:
+        ftp = FTP(args.ip, user = args.password, timeout = FTP_TIMEOUT) # Yes send password as user
+        with open(filename, 'rb') as fw:
+          ftp.storbinary('STOR ' + os.path.basename(filename), fw)
+        ftp.quit()
+        # A completed STOR proves the transfer only, not that the printer
+        # accepted the image; the verification step below is authoritative.
+        upload_result = UPLOAD_OK
+      except all_errors as e:
+        print('Firmware update aborted due to error while uploading')
+        print(e)
+  except KeyboardInterrupt:
+    print()
+    print(_interrupt_during_upload(filename))
+    return EXIT_UPLOAD
 
   if upload_result == UPLOAD_INCOMPLETE:
     print(_incomplete_message(filename))
@@ -739,8 +792,17 @@ def update_firmware(cat, version):
 
   # TCP 9100 is fire-and-forget: confirm the printer came back on the
   # expected version instead of trusting "the socket did not raise".
-  status, actual = _verify_flash(
-      args.ip, getattr(args, 'community', 'public'), cat, artifact_version)
+  #
+  # Interrupting here is safe — the image is already on the printer and it is
+  # rebooting — but the outcome is unconfirmed, so report that honestly
+  # rather than claiming a success that was never checked.
+  try:
+    status, actual = _verify_flash(
+        args.ip, getattr(args, 'community', 'public'), cat, artifact_version)
+  except KeyboardInterrupt:
+    print()
+    print(_interrupt_during_verification(filename, artifact_version))
+    return EXIT_UNVERIFIED
 
   if status == 'unverified':
     print('Uploaded, but the version could not be verified because the '
@@ -760,11 +822,24 @@ def update_firmware(cat, version):
   return EXIT_OK
 
 
+class SnmpError(Exception):
+    """An SNMP-stage failure, carrying the exit code the CLI should report.
+
+    Raised instead of calling sys.exit() so the caller can distinguish a
+    printer that never answered (EXIT_PRINTER) from a protocol-level error
+    on a printer that did answer (EXIT_ERROR).
+    """
+
+    def __init__(self, message, exit_code=EXIT_ERROR):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
 async def _snmp_walk_table(ip, community, oid):
     """Walk an SNMP OID on a Brother printer using pysnmp 7.x async API.
     
     Returns: list of rows, each row is list of (oid_str, value_str) tuples.
-    Raises SystemExit on SNMP errors.
+    Raises SnmpError on SNMP errors.
     """
     transport = await UdpTransportTarget.create(
         (ip, 161), timeout=30
@@ -778,14 +853,17 @@ async def _snmp_walk_table(ip, community, oid):
         lexicographicMode=False,
     ):
         if errorIndication:
-            print(errorIndication, file=sys.stderr)
-            sys.exit(1)
+            raise SnmpError(
+                'No SNMP response from %s (%s). The printer may be off, on a '
+                'different address, or have SNMP disabled.'
+                % (ip, errorIndication),
+                EXIT_PRINTER)
         if errorStatus:
-            print('ERROR: %s at %s' % (
-                errorStatus.prettyPrint(),
-                errorIndex and varBinds[int(errorIndex) - 1] or '?'),
-                file=sys.stderr)
-            sys.exit(1)
+            raise SnmpError(
+                'SNMP error reading the printer: %s at %s' % (
+                    errorStatus.prettyPrint(),
+                    errorIndex and varBinds[int(errorIndex) - 1] or '?'),
+                EXIT_ERROR)
         row = []
         for varBind in varBinds:
             oid_str = str(varBind[0])
@@ -814,9 +892,20 @@ def main() -> int:
         print('Getting SNMP data from printer at %s...' % args.ip)
         sys.stdout.flush()
 
-        table = asyncio.run(_snmp_walk_table(
-            args.ip, args.community, BROTHER_SNMP_OID,
-        ))
+        try:
+            table = asyncio.run(_snmp_walk_table(
+                args.ip, args.community, BROTHER_SNMP_OID,
+            ))
+        except SnmpError as e:
+            # An off or unreachable printer is the single most common way
+            # this tool fails, so it gets its own exit code rather than
+            # being reported as an internal error.
+            print(str(e), file=sys.stderr)
+            return e.exit_code
+        except OSError as e:
+            print('Cannot reach the printer at %s:161 — %s' % (args.ip, e),
+                  file=sys.stderr)
+            return EXIT_PRINTER
 
         print('done')
 
@@ -891,6 +980,14 @@ def main() -> int:
             print('FAILURE: firmware update did not complete (exit code %d)'
                   % final)
         return final
+
+    except KeyboardInterrupt:
+        # A deliberate Ctrl-C outside the upload window left nothing
+        # half-written on the printer, so report a clean interrupt instead of
+        # a traceback. 130 is the shell convention for SIGINT.
+        print()
+        print('Interrupted.')
+        return EXIT_INTERRUPTED
 
     except Exception as e:
         print(e, file=sys.stderr)
