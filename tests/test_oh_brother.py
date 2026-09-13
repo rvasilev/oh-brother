@@ -306,11 +306,12 @@ class TestMainSmoke:
         called_with = []
         def fake_update(cat, ver):
             called_with.append((cat, ver))
+            return oh.EXIT_OK
         monkeypatch.setattr(oh, "update_firmware", fake_update)
 
         monkeypatch.setattr(oh, "_snmp_walk_table", fake_walk_cmd)
         monkeypatch.setattr("sys.argv", ["oh-brother.py", "1.2.3.4"])
-        oh.main()
+        assert oh.main() == oh.EXIT_OK
 
         assert called_with == [("MAIN", "1.24")]
 
@@ -328,7 +329,8 @@ class TestMainSmoke:
         monkeypatch.setattr("builtins.input", lambda _=None: None)
         called_with = []
         monkeypatch.setattr(
-            oh, "update_firmware", lambda c, v: called_with.append((c, v))
+            oh, "update_firmware",
+            lambda c, v: called_with.append((c, v)) or oh.EXIT_OK,
         )
 
         monkeypatch.setattr(oh, "_snmp_walk_table", fake_walk_cmd)
@@ -354,7 +356,8 @@ class TestMainSmoke:
         monkeypatch.setattr("builtins.input", lambda _=None: None)
         called_with = []
         monkeypatch.setattr(
-            oh, "update_firmware", lambda c, v: called_with.append((c, v))
+            oh, "update_firmware",
+            lambda c, v: called_with.append((c, v)) or oh.EXIT_OK,
         )
 
         monkeypatch.setattr(oh, "_snmp_walk_table", fake_walk_cmd)
@@ -427,7 +430,7 @@ class TestMainSmoke:
         called_with = []
         def fake_update(cat, ver):
             called_with.append((cat, ver))
-            return True
+            return oh.EXIT_OK
         monkeypatch.setattr(oh, "update_firmware", fake_update)
 
         sleep_calls = []
@@ -448,13 +451,13 @@ class TestUpdateFirmware:
     """Tests for update_firmware() with mocked external I/O."""
 
     def test_version_up_to_date(self, monkeypatch):
-        """VERSIONCHECK=1 → prints 'up to date' and returns None."""
+        """VERSIONCHECK=1 without --reflash → EXIT_CURRENT, no fallback."""
         from unittest.mock import MagicMock
         from types import SimpleNamespace
 
         oh.args = SimpleNamespace(
             beta=False, verbose=False, test=False, yes=False,
-            ip="1.2.3.4", password=None,
+            ip="1.2.3.4", password=None, reflash=False,
         )
         oh.model = "HL-L2865DW"
         oh.spec = "0906"
@@ -465,16 +468,17 @@ class TestUpdateFirmware:
         monkeypatch.setattr(oh.urllib.request, "urlopen", lambda req, timeout=None: mock_response)
 
         result = oh.update_firmware("MAIN", "1.24")
-        assert result is False
+        assert result == oh.EXIT_CURRENT
+        assert result != oh.EXIT_OK
 
     def test_no_path_returns_none(self, monkeypatch):
-        """No PATH element → prints message and returns None."""
+        """No PATH element and fallback fails → EXIT_VENDOR."""
         from unittest.mock import MagicMock
         from types import SimpleNamespace
 
         oh.args = SimpleNamespace(
             beta=False, verbose=False, test=False, yes=False,
-            ip="1.2.3.4", password=None,
+            ip="1.2.3.4", password=None, reflash=False,
         )
         oh.model = "HL-L2865DW"
         oh.spec = "0906"
@@ -495,7 +499,7 @@ class TestUpdateFirmware:
         monkeypatch.setattr(oh.urllib.request, "urlopen", lambda req, timeout=None: mock_response)
 
         result = oh.update_firmware("MAIN", "1.24")
-        assert result is False
+        assert result == oh.EXIT_VENDOR
 
     @pytest.mark.skip(reason="update_firmware HTTP mocking needs deeper integration — real urlopen intercepts")
     def test_test_flag_stops_before_upload(self, monkeypatch, tmp_path):
@@ -545,7 +549,7 @@ class TestUpdateFirmware:
 
         oh.args = SimpleNamespace(
             beta=False, verbose=False, test=False, yes=True,
-            ip="1.2.3.4", password=None,
+            ip="1.2.3.4", password=None, reflash=False,
         )
         oh.model = "HL-L2865DW"
         oh.spec = "0906"
@@ -560,14 +564,14 @@ class TestUpdateFirmware:
         oh.update_firmware("MAIN", "1.24")
         assert len(input_calls) == 0
 
-    def test_vcheck1_fallback_succeeds(self, monkeypatch):
-        """VCHECK=1 with fallback → retries with decremented version, gets PATH."""
+    def test_vcheck1_fallback_succeeds(self, monkeypatch, tmp_path):
+        """VCHECK=1 WITH --reflash → retries with decremented version, gets PATH."""
         from unittest.mock import MagicMock
         from types import SimpleNamespace
 
         oh.args = SimpleNamespace(
             beta=False, verbose=False, test=True, yes=True,
-            ip="1.2.3.4", password=None,
+            ip="1.2.3.4", password=None, reflash=True,
         )
         oh.model = "HL-L2865DW"
         oh.spec = "0906"
@@ -594,26 +598,27 @@ class TestUpdateFirmware:
                 # Second call: fallback with decremented version → PATH
                 m.read.return_value = xml_update
             else:
-                # Third call: firmware download — return data then empty
-                m.read.side_effect = [b"\x00" * 2048, b""]
+                # Third call: firmware download — 200KB then done
+                m.read.side_effect = [b"\x00" * 204800, b""]
+                m.headers.get.return_value = None
             return m
 
         monkeypatch.setattr(oh.urllib.request, "urlopen", mock_urlopen)
         monkeypatch.setattr("builtins.input", lambda _=None: None)
-        monkeypatch.chdir("/tmp")
+        monkeypatch.chdir(tmp_path)
 
         result = oh.update_firmware("MAIN", "1.24")
-        assert result is False  # --test mode, no upload
-        assert call_count[0] >= 2  # At least first call + fallback
+        assert result == oh.EXIT_OK  # --test mode: downloaded + verified
+        assert call_count[0] >= 3  # original + fallback + download
 
     def test_vcheck1_fallback_fails(self, monkeypatch):
-        """VCHECK=1, fallback also returns VCHECK=1 → gives up."""
+        """VCHECK=1 with --reflash, fallback also VCHECK=1 → EXIT_VENDOR."""
         from unittest.mock import MagicMock
         from types import SimpleNamespace
 
         oh.args = SimpleNamespace(
             beta=False, verbose=False, test=False, yes=True,
-            ip="1.2.3.4", password=None,
+            ip="1.2.3.4", password=None, reflash=True,
         )
         oh.model = "HL-L2865DW"
         oh.spec = "0906"
@@ -630,7 +635,7 @@ class TestUpdateFirmware:
         monkeypatch.setattr("builtins.input", lambda _=None: None)
 
         result = oh.update_firmware("MAIN", "1.24")
-        assert result is False
+        assert result == oh.EXIT_VENDOR
         assert call_count[0] == 2  # Original + fallback, both VCHECK=1
 
 
@@ -920,3 +925,211 @@ class TestHttpPost:
                                   {"Content-Type": "text/xml"})
         assert data is None
         assert "network" in err.lower() or "dns" in err.lower() or "connect" in err.lower()
+
+
+# ---------------------------------------------------------------------------
+# Safety gates: exit codes, already-current gate, downgrade block, TTY gate
+# ---------------------------------------------------------------------------
+
+XML_UPDATE_124 = (
+    b'<?xml version="1.0" encoding="UTF-8" ?>'
+    b'<RESPONSEINFO>'
+    b'<FIRMUPDATEINFO>'
+    b'<VERSIONCHECK>0</VERSIONCHECK>'
+    b'<PATH>http://update-akamai.brother.co.jp/CS/D02FZM_124Q_crypt.djf</PATH>'
+    b'</FIRMUPDATEINFO>'
+    b'</RESPONSEINFO>'
+)
+
+XML_UPDATE_120 = (
+    b'<?xml version="1.0" encoding="UTF-8" ?>'
+    b'<RESPONSEINFO>'
+    b'<FIRMUPDATEINFO>'
+    b'<VERSIONCHECK>0</VERSIONCHECK>'
+    b'<PATH>http://update-akamai.brother.co.jp/CS/D02FZM_120Q_crypt.djf</PATH>'
+    b'</FIRMUPDATEINFO>'
+    b'</RESPONSEINFO>'
+)
+
+
+def _args(**overrides):
+    from types import SimpleNamespace
+    base = dict(beta=False, verbose=False, test=False, yes=True,
+                ip="1.2.3.4", password=None, reflash=False)
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _download_response(size=204800):
+    from unittest.mock import MagicMock
+    resp = MagicMock()
+    resp.read.side_effect = [b"\x00" * size, b""]
+    resp.headers.get.return_value = None
+    return resp
+
+
+class TestSafetyGates:
+    """End-to-end guards on the flash path."""
+
+    def test_vcheck1_does_not_upload_without_reflash(self, monkeypatch, capsys):
+        """VERSIONCHECK=1 without --reflash: no fallback, no download, no upload."""
+        oh.args = _args(reflash=False)
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (REAL_BROTHER_RESPONSE_UP_TO_DATE, None))
+
+        fallback_calls = []
+        monkeypatch.setattr(oh, "_try_version_fallback",
+                            lambda *a, **k: fallback_calls.append(1) or None)
+
+        def no_download(*a, **k):
+            raise AssertionError("firmware must not be downloaded")
+
+        def no_socket(*a, **k):
+            raise AssertionError("no socket may be opened")
+
+        monkeypatch.setattr(oh.urllib.request, "urlopen", no_download)
+        monkeypatch.setattr(oh.socket, "socket", no_socket)
+        monkeypatch.setattr(oh.socket, "getaddrinfo", no_socket)
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_CURRENT
+        assert fallback_calls == []
+        out = capsys.readouterr().out
+        assert "already up to date" in out.lower()
+
+    def test_reflash_flag_enables_current_version_upload(self, monkeypatch, tmp_path):
+        """With --reflash the fallback path is allowed to run."""
+        oh.args = _args(reflash=True, test=True)
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+
+        api_calls = []
+
+        def fake_post(url, data, hdrs, *a, **k):
+            api_calls.append(1)
+            if len(api_calls) == 1:
+                return REAL_BROTHER_RESPONSE_UP_TO_DATE, None
+            return XML_UPDATE_124, None
+
+        monkeypatch.setattr(oh, "_http_post", fake_post)
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+        monkeypatch.chdir(tmp_path)
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_OK
+        assert len(api_calls) == 2  # original + fallback, proving fallback ran
+
+    def test_downgrade_blocked_when_artifact_older_than_installed(
+            self, monkeypatch, tmp_path, capsys):
+        """Artifact 1.20 vs installed 1.24 → refused, nothing downloaded."""
+        oh.args = _args()
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_120, None))
+
+        def no_download(*a, **k):
+            raise AssertionError("downgrade artifact must not be downloaded")
+
+        monkeypatch.setattr(oh.urllib.request, "urlopen", no_download)
+        monkeypatch.chdir(tmp_path)
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_REFUSED
+        out = capsys.readouterr().out
+        assert "1.20" in out and "1.24" in out
+
+    def test_upload_failure_exits_nonzero(self, monkeypatch, tmp_path):
+        """A failed upload yields EXIT_UPLOAD (non-zero)."""
+        from unittest.mock import MagicMock
+
+        oh.args = _args()
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, sock: False)
+        monkeypatch.setattr(oh.socket, "getaddrinfo",
+                            lambda *a, **k: [(2, 1, 6, '', ('1.2.3.4', 9100))])
+        monkeypatch.setattr(oh.socket, "socket", lambda *a: MagicMock())
+        monkeypatch.chdir(tmp_path)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        assert result == oh.EXIT_UPLOAD
+        assert result != oh.EXIT_OK
+
+    def test_upload_failure_message_is_not_no_update_needed(self, monkeypatch, capsys):
+        """A failed upload must never be reported as 'nothing needed'."""
+        async def fake_walk(*a, **k):
+            return [[(str(o), str(v)) for o, v in row]
+                    for row in REAL_SNMP_TABLE]
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", fake_walk)
+        monkeypatch.setattr(oh, "update_firmware", lambda c, v: oh.EXIT_UPLOAD)
+        monkeypatch.setattr("builtins.input", lambda _=None: None)
+        monkeypatch.setattr("sys.argv", ["oh-brother.py", "--yes", "1.2.3.4"])
+
+        code = oh.main()
+        out = capsys.readouterr().out
+        assert code == oh.EXIT_UPLOAD
+        assert "No firmware update was needed" not in out
+        assert "FAILURE" in out
+
+    def test_non_tty_without_yes_refuses_to_flash(self, monkeypatch, tmp_path):
+        """stdin not a TTY and no --yes → no socket is ever created."""
+        class FakeStdin:
+            def isatty(self):
+                return False
+
+        oh.args = _args(yes=False)
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+
+        monkeypatch.setattr(oh.sys, "stdin", FakeStdin())
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+
+        def no_socket(*a, **k):
+            raise AssertionError("must refuse before opening a socket")
+
+        monkeypatch.setattr(oh.socket, "socket", no_socket)
+        monkeypatch.setattr(oh.socket, "getaddrinfo", no_socket)
+        monkeypatch.chdir(tmp_path)
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_REFUSED
+
+    def test_validate_url_rejects_suffix_domain(self):
+        """Look-alike domains must not pass the allow-list."""
+        for url in ("http://evilbrother.com/CS/x.djf",
+                    "http://notbrother.com/CS/x.djf"):
+            valid, err = oh._validate_firmware_url(url)
+            assert valid is False, url
+            assert "domain" in err.lower()
+
+    def test_missing_model_or_spec_aborts_before_api(self, monkeypatch, capsys):
+        """model=None aborts before any vendor request is made."""
+        oh.args = _args()
+        oh.model = None
+        oh.spec = "0906"
+
+        def no_post(*a, **k):
+            raise AssertionError("vendor API must not be called")
+
+        monkeypatch.setattr(oh, "_http_post", no_post)
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_REFUSED
+        out = capsys.readouterr().out
+        assert "REFUSING" in out
+
+    def test_parse_artifact_version(self):
+        """Version extraction from real Brother artifact names."""
+        assert oh._parse_artifact_version("D02FZM_124Q_crypt.djf") == "1.24"
+        assert oh._parse_artifact_version("D00KJY_F") is None
+        assert oh._parse_artifact_version("LZ2751_L") is None

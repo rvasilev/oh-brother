@@ -21,6 +21,7 @@ from pysnmp.hlapi.v1arch import (
 import urllib.request, urllib.error, urllib.parse
 import xml.etree.ElementTree as ET
 import argparse
+import re
 import asyncio
 import sys
 import socket
@@ -64,6 +65,18 @@ BROTHER_API_URL = (
     'kne_bh7_update_nt_ssl/ifax2.asmx/fileUpdate'
 )
 BROTHER_SNMP_OID = '1.3.6.1.4.1.2435.2.4.3.99.3.1.6.1.2'
+
+# Exit-code contract for update_firmware()/main().
+EXIT_OK         = 0
+EXIT_ERROR      = 1
+EXIT_USAGE      = 2
+EXIT_CURRENT    = 3
+EXIT_PRINTER    = 4
+EXIT_VENDOR     = 5
+EXIT_DOWNLOAD   = 6
+EXIT_UPLOAD     = 7
+EXIT_UNVERIFIED = 8
+EXIT_REFUSED    = 9
 
 
 def parse_snmp_table(table, verbose=False):
@@ -178,6 +191,9 @@ parser.add_argument('-p', '--password',
                     '(default is passwordless upload via TCP port 9100)')
 parser.add_argument('-y', '--yes', action = 'store_true',
                     help = 'Skip all confirmation prompts (non-interactive mode)')
+parser.add_argument('--reflash', action = 'store_true',
+                    help = 'Re-apply the current firmware version even when the '
+                    'printer already reports it as up to date')
 
 
 def prompt(msg):
@@ -207,6 +223,40 @@ def _decrement_version(version_str):
     return None
 
 
+def _version_tuple(version_str):
+    """Parse a dotted numeric version into a comparable tuple.
+
+    Returns: tuple of ints, or None if the string is not fully numeric.
+    """
+    if not version_str:
+        return None
+    try:
+        return tuple(int(part) for part in str(version_str).split('.'))
+    except (ValueError, TypeError):
+        return None
+
+
+_ARTIFACT_VERSION_RE = re.compile(r'_(\d{3})([A-Za-z])')
+
+
+def _parse_artifact_version(filename):
+    """Extract a firmware version from an artifact filename.
+
+    Brother filenames encode the version as three digits followed by a
+    letter, e.g. D02FZM_124Q_crypt.djf -> '1.24'. Letter-only names such
+    as D00KJY_F or LZ2751_L do not match.
+
+    Returns: version string like '1.24', or None when unparseable.
+    """
+    if not filename:
+        return None
+    match = _ARTIFACT_VERSION_RE.search(filename)
+    if not match:
+        return None
+    digits = match.group(1)
+    return '%s.%s' % (digits[0], digits[1:])
+
+
 def _validate_firmware_url(url):
     """Validate firmware download URL for safety.
     
@@ -221,7 +271,8 @@ def _validate_firmware_url(url):
     if parsed.scheme not in ('http', 'https'):
         return False, "unexpected scheme: %s" % parsed.scheme
     allowed_domains = ('brother.co.jp', 'brother.com', 'brother.eu')
-    if not any(parsed.netloc.endswith(d) for d in allowed_domains):
+    host = parsed.hostname or ''
+    if not any(host == d or host.endswith('.' + d) for d in allowed_domains):
         return False, "unexpected domain: %s" % parsed.netloc
     path = parsed.path.lower()
     if not (path.endswith('.djf') or path.endswith('.upd')):
@@ -345,6 +396,16 @@ def _try_version_fallback(version, cat, url, hdrs):
 def update_firmware(cat, version):
   global args
 
+  # R7: never interpolate model/spec=None into the vendor XML.
+  forced = (getattr(args, 'category', None) and
+            getattr(args, 'fw_version', None) and
+            args.fw_version != 'B0000000000')
+  if not forced and (not model or not spec):
+    print('REFUSING to query the vendor server: missing model or spec '
+          '(model=%r, spec=%r).' % (model, spec))
+    print('Re-run with --model and valid SNMP data, or force -c/-f explicitly.')
+    return EXIT_REFUSED
+
   print('Updating %s version %s' % (cat, version))
 
   requestInfo = build_firmware_xml(model, spec, cat, version, beta=args.beta)
@@ -361,7 +422,7 @@ def update_firmware(cat, version):
   response, http_err = _http_post(url, requestInfo, hdrs)
   if response is None:
     print('Error: %s' % http_err)
-    return False
+    return EXIT_VENDOR
 
   print('done')
 
@@ -370,12 +431,14 @@ def update_firmware(cat, version):
   result = parse_brother_response(response)
   if result['version_check'] == '1':
     print('Firmware already up to date')
-    # Try version fallback to get firmware URL for backup/download
+    if not getattr(args, 'reflash', False):
+      # R1: already current is terminal unless --reflash was given.
+      return EXIT_CURRENT
     firmwareURL = _try_version_fallback(version, cat, url, hdrs)
     if firmwareURL:
       print('Found firmware URL via version fallback')
     else:
-      return False
+      return EXIT_VENDOR
   elif result['firmware_url'] is None:
     print('No firmware update info path found '
           '(newer Brother models require version fallback)')
@@ -383,7 +446,7 @@ def update_firmware(cat, version):
     if firmwareURL:
       print('Found firmware URL via version fallback')
     else:
-      return False
+      return EXIT_VENDOR
   else:
     firmwareURL = result['firmware_url']
 
@@ -392,13 +455,30 @@ def update_firmware(cat, version):
   if not valid:
     print('Error: firmware URL validation failed: %s' % err)
     print('URL: %s' % firmwareURL)
-    return False
+    return EXIT_VENDOR
 
   # Extract filename from URL (strip query parameters)
   filename = os.path.basename(urlparse(firmwareURL).path)
   if not filename:
     print('Error: could not extract filename from firmware URL')
-    return False
+    return EXIT_VENDOR
+
+  # R7: refuse a known-older artifact; warn loudly when unparseable.
+  artifact_version = _parse_artifact_version(filename)
+  installed = _version_tuple(version)
+  artifact = _version_tuple(artifact_version)
+  if artifact_version is None or installed is None or artifact is None:
+    print('WARNING: could not verify firmware version from artifact name!')
+    print('         raw artifact filename: %s' % filename)
+    print('         parsed artifact version: %r (installed: %r)'
+          % (artifact_version, version))
+    print('         Proceeding without a downgrade check — verify manually!')
+  elif artifact < installed:
+    print('REFUSING to flash: artifact version %s is OLDER than the installed '
+          'version %s.' % (artifact_version, version))
+    print('Artifact: %s' % filename)
+    print('This looks like a downgrade; there is no override flag.')
+    return EXIT_REFUSED
 
   # Download firmware
   print('Downloading firmware file %s from vendor server...' % filename)
@@ -409,10 +489,10 @@ def update_firmware(cat, version):
     response = urllib.request.urlopen(req, timeout=30)
   except urllib.error.HTTPError as e:
     print('Error: HTTP %d (%s) from Brother CDN — try again later.' % (e.code, e.reason))
-    return False
+    return EXIT_DOWNLOAD
   except urllib.error.URLError as e:
     print('Error: download failed — %s' % e.reason)
-    return False
+    return EXIT_DOWNLOAD
 
   content_length = response.headers.get('Content-Length')
 
@@ -431,11 +511,19 @@ def update_firmware(cat, version):
   if not valid:
     print('Error: firmware integrity check failed: %s' % err)
     os.remove(filename)
-    return False
+    return EXIT_DOWNLOAD
 
   if args.test:
     os.remove(filename)
-    return False
+    return EXIT_OK
+
+  # R2: refuse to flash unattended with no explicit consent.
+  if not args.yes and not sys.stdin.isatty():
+    print('REFUSING to flash firmware unattended.')
+    print('No --yes flag was given and stdin is not a terminal.')
+    print('Re-run with --yes for unattended use, or from an interactive terminal.')
+    os.remove(filename)
+    return EXIT_REFUSED
 
   print('About to upload the firmware to printer.')
   print('This is a dangerous action since it is potentially destructive.')
@@ -476,7 +564,8 @@ def update_firmware(cat, version):
   os.remove(filename)
 
   if not success:
-    return False
+    print('Firmware upload failed — the printer did not accept the image.')
+    return EXIT_UPLOAD
 
   print('done')
   print()
@@ -484,7 +573,7 @@ def update_firmware(cat, version):
   if not args.yes:
     prompt('Press Enter to continue...')
 
-  return True
+  return EXIT_OK
 
 
 async def _snmp_walk_table(ip, community, oid):
@@ -522,7 +611,7 @@ async def _snmp_walk_table(ip, community, oid):
     return table
 
 
-def main():
+def main() -> int:
     global args, serial, model, spec, firmInfo
 
     try:
@@ -573,7 +662,7 @@ def main():
 
         print()
 
-        updated = False
+        codes = []
         num_firmwares = len(firmInfo)
         if num_firmwares > 1:
             print('WARNING: %d firmware updates pending. '
@@ -584,23 +673,37 @@ def main():
 
         for i, entry in enumerate(firmInfo):
             print()
-            if update_firmware(entry['cat'], entry['version']):
-                updated = True
-                if i < num_firmwares - 1:
-                    print('Waiting 30 seconds for printer to stabilize...')
-                    sys.stdout.flush()
-                    time.sleep(30)
+            code = update_firmware(entry['cat'], entry['version'])
+            codes.append(code)
+            if code == EXIT_OK and i < num_firmwares - 1:
+                print('Waiting 30 seconds for printer to stabilize...')
+                sys.stdout.flush()
+                time.sleep(30)
+
+        # Worst-wins: an upload failure must never be hidden behind another
+        # category's success.
+        failures = [c for c in codes if c not in (EXIT_OK, EXIT_CURRENT)]
+        if failures:
+            final = max(failures)
+        elif EXIT_OK in codes:
+            final = EXIT_OK
+        else:
+            final = EXIT_CURRENT
 
         print()
-        if updated:
+        if final == EXIT_OK:
             print('Firmware update completed')
-        else:
+        elif final == EXIT_CURRENT:
             print('No firmware update was needed')
+        else:
+            print('FAILURE: firmware update did not complete (exit code %d)'
+                  % final)
+        return final
 
     except Exception as e:
         print(e, file=sys.stderr)
-        sys.exit(1)
+        return EXIT_ERROR
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
