@@ -142,6 +142,10 @@ DOWNLOAD_HARD_CAP = 64 * 1024 * 1024    # 64 MB
 READY_TIMEOUT = 300
 READY_POLL = 5
 
+# R16 upload-reachability probe (seconds). Advisory only: a successful TCP
+# connect proves port 9100 is open, not that the printer will accept an image.
+PREFLIGHT_TIMEOUT = 5
+
 
 def parse_snmp_table(table, verbose=False):
     """Parse SNMP walk result table into model/serial/spec/firmware info.
@@ -269,9 +273,32 @@ parser.add_argument('--version', action = 'version',
                     version = '%(prog)s ' + _version())
 
 
+def _isatty(stream):
+    """True only when a standard stream exists and is a terminal.
+
+    CPython sets sys.stdin/sys.stdout to None when the underlying fd is
+    closed, and GUI-embedded interpreters get NULL standard handles. A
+    missing stream means "not a terminal", which preserves the default-deny
+    posture: a stream-less launch refuses rather than crashing.
+    """
+    return bool(stream) and stream.isatty()
+
+
+def _flush(stream=None):
+    """Flush a text stream only when it is present and flushable.
+
+    print() to a None stdout is a silent no-op, but flush() raises
+    AttributeError, so every operator-facing flush goes through here.
+    """
+    if stream is None:
+        stream = sys.stdout
+    if stream and hasattr(stream, 'flush'):
+        stream.flush()
+
+
 def prompt(msg):
     """Show a prompt if stdin is a TTY; otherwise silently skip."""
-    if sys.stdin.isatty():
+    if _isatty(sys.stdin):
         input(msg)
 
 
@@ -675,7 +702,9 @@ def _query_printer_version(ip, community, cat):
     (still rebooting) or does not report the category.
     """
     try:
-        table = asyncio.run(_snmp_walk_table(ip, community, BROTHER_SNMP_OID))
+        table = asyncio.run(asyncio.wait_for(
+            _snmp_walk_table(ip, community, BROTHER_SNMP_OID), SNMP_DEADLINE,
+        ))
     except (Exception, SystemExit):
         return None
     info = parse_snmp_table(table)
@@ -824,6 +853,20 @@ def _try_version_fallback(version, cat, url, hdrs):
     return result.get('firmware_url')
 
 
+def _printer_port_open(ip, port, timeout):
+    """Best-effort TCP reachability probe; True when a connect succeeds.
+
+    Advisory by design. A successful connect proves the port is open, not
+    that the printer will accept a firmware image, so the caller warns rather
+    than refuses. Opens a socket and closes it immediately.
+    """
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def update_firmware(cat, version):
   global args
 
@@ -848,7 +891,7 @@ def update_firmware(cat, version):
   hdrs = {'Content-Type': 'text/xml', 'User-Agent': 'BrHttpc/1.00'}
 
   print('Looking up printer firmware info at vendor server...')
-  sys.stdout.flush()
+  _flush()
 
   response, http_err = _http_post(url, requestInfo, hdrs)
   if response is None:
@@ -913,11 +956,24 @@ def update_firmware(cat, version):
 
   # R2: refuse to flash unattended with no explicit consent, BEFORE the
   # ~15 MB download. --test is non-destructive and needs no consent.
-  if not args.test and not args.yes and not sys.stdin.isatty():
+  if not args.test and not args.yes and not _isatty(sys.stdin):
     print('REFUSING to flash firmware unattended.')
     print('No --yes flag was given and stdin is not a terminal.')
     print('Re-run with --yes for unattended use, or from an interactive terminal.')
     return EXIT_REFUSED
+
+  # R16: a read-only reachability probe before the ~15 MB download. This is a
+  # warning, NOT an upload safety gate: a successful connect proves port 9100
+  # is open, not that the printer will accept an image. Refusing here would
+  # only remove the retained-image path for an offline printer. --test must
+  # still fetch a backup, and --password selects FTP, where 9100 is irrelevant.
+  if not args.test and not args.password:
+    if not _printer_port_open(args.ip, 9100, PREFLIGHT_TIMEOUT):
+      print('WARNING: the printer at %s:9100 did not accept a TCP connect.'
+            % args.ip)
+      print('The upload will likely fail. The download will continue so the '
+            'firmware image is retained for a later retry.')
+      print('An administrator password (FTP) upload path is unaffected.')
 
   # Resolve the retained-image location and make it usable ONCE, before the
   # ~15 MB download. Discovering an unwritable backup root after the transfer
@@ -950,7 +1006,7 @@ def update_firmware(cat, version):
 
   # Download firmware
   print('Downloading firmware file %s from vendor server...' % filename)
-  sys.stdout.flush()
+  _flush()
 
   # A per-invocation partial name inside the backup directory: concurrent runs
   # cannot collide on it, it is never visible under a real firmware name, and
@@ -1042,8 +1098,9 @@ def update_firmware(cat, version):
                   % (declared, written))
             _remove_quietly(part_filename)
             return EXIT_DOWNLOAD
-          sys.stdout.write('.')
-          sys.stdout.flush()
+          if sys.stdout:
+            sys.stdout.write('.')
+            _flush()
     except (OSError, http.client.HTTPException) as e:
       print()
       print('Error: firmware download interrupted: %s' % e)
@@ -1144,7 +1201,7 @@ def update_firmware(cat, version):
   # partial image, so a Ctrl-C in this window is not a harmless abort: it has
   # to be caught and explained rather than allowed to escape as a traceback.
   print('Now uploading firmware to printer (DO NOT REMOVE POWER!)...')
-  sys.stdout.flush()
+  _flush()
 
   upload_result = UPLOAD_FAILED
   try:
@@ -1338,7 +1395,7 @@ def main() -> int:
 
         # Get SNMP data
         print('Getting SNMP data from printer at %s...' % args.ip)
-        sys.stdout.flush()
+        _flush()
 
         try:
             table = asyncio.run(asyncio.wait_for(
@@ -1430,7 +1487,7 @@ def main() -> int:
                 # with a fixed sleep.
                 print('Waiting for the printer to come back before the next '
                       'update...')
-                sys.stdout.flush()
+                _flush()
                 waited = _wait_for_printer_ready(
                     args.ip, getattr(args, 'community', 'public'))
                 if waited is None:

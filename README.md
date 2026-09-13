@@ -88,6 +88,14 @@ Currently the script does the following:
       `--reflash` was not given.
     * Download the firmware from Brother, verifying its size against the
       declared `Content-Length`.
+    * Before that download, and only when neither `--test` nor `--password`
+      applies, make a short TCP connection to port 9100 and warn if it is
+      refused. This is a reachability warning, not an upload safety gate: a
+      successful connect proves the port is open, not that the printer will
+      accept an image. The warning does not abort the download, because the
+      retained recovery image is still worth having for a later retry; the FTP
+      upload path (with an administrator password) does not use port 9100 and
+      is unaffected.
     * Retain the downloaded image under
       `firmware_backups/<MODEL>/<version>/` as a recovery copy. Set the
       `OH_BROTHER_BACKUP_DIR` environment variable to keep that tree under a

@@ -285,6 +285,19 @@ def reset_global_state(monkeypatch):
         monkeypatch.setattr(oh, attr, None, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def no_real_preflight(monkeypatch):
+    """Never let a test dial the printer's upload port.
+
+    The R16 preflight is a real TCP connect; left unpatched, every flash-path
+    test would reach 1.2.3.4:9100. The preflight tests override this seam.
+    ``raising=False`` keeps the fixture inert against a pre-packet source that
+    has no such helper, so a RED run fails on behaviour, not on the fixture.
+    """
+    monkeypatch.setattr(oh, "_printer_port_open", lambda *a, **k: True,
+                        raising=False)
+
+
 # ---------------------------------------------------------------------------
 # main()
 # ---------------------------------------------------------------------------
@@ -2855,3 +2868,192 @@ class TestConditionalReuse:
 
         assert result == oh.EXIT_OK
         assert not self._validator(self._backup(tmp_path)).exists()
+
+
+# ---------------------------------------------------------------------------
+# Packet 4 (P6): NULL standard streams must not launder a refusal into exit 1
+# ---------------------------------------------------------------------------
+
+class TestStreamGuards:
+    """P6: CPython sets sys.stdin/sys.stdout to None when the fd is closed.
+
+    sys.stdin.isatty() and sys.stdout.flush() then raise AttributeError. The
+    consent gate must treat a missing stream as "not a terminal" and return
+    EXIT_REFUSED (9), not let the crash become EXIT_ERROR (1).
+    """
+
+    def test_isatty_none_is_false(self):
+        assert oh._isatty(None) is False
+
+    def test_isatty_non_tty_stream_is_false(self):
+        import io
+        assert oh._isatty(io.TextIOWrapper(io.BytesIO())) is False
+
+    def test_isatty_tty_stream_is_true(self):
+        class FakeTTY:
+            def isatty(self):
+                return True
+
+        assert oh._isatty(FakeTTY()) is True
+
+    def test_null_stdin_without_yes_refuses_not_errors(
+            self, monkeypatch, capsys):
+        """The headline assertion: a stream-less launch returns 9, not 1."""
+        async def fake_walk_cmd(*args, **kwargs):
+            return [[(str(oid), str(val)) for oid, val in row]
+                    for row in REAL_SNMP_TABLE]
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", fake_walk_cmd)
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+        monkeypatch.setattr(oh.sys, "stdin", None)
+        monkeypatch.setattr("sys.argv", ["oh-brother.py", "1.2.3.4"])
+
+        code = oh.main()
+        out = capsys.readouterr().out
+
+        assert code == oh.EXIT_REFUSED
+        assert code == 9
+        assert code != oh.EXIT_ERROR
+        assert code != 1
+        assert "REFUSING to flash firmware unattended" in out
+
+    def test_prompt_with_null_stdin_does_not_raise(self, monkeypatch):
+        monkeypatch.setattr(oh.sys, "stdin", None)
+        oh.prompt("continue?")          # must be a silent no-op
+
+    def test_null_stdout_survives_the_download_path(
+            self, monkeypatch, tmp_path):
+        """flush() and the progress dot must not raise on a None stdout."""
+        oh.args = _args(test=True)
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(oh.sys, "stdout", None)
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_OK
+        assert list(tmp_path.rglob("*.djf"))
+
+
+# ---------------------------------------------------------------------------
+# Packet 4 (P7): the flash-verification walk must be bounded
+# ---------------------------------------------------------------------------
+
+class TestBoundedWalkGap:
+    """P7: _query_printer_version was the only SNMP call without a deadline."""
+
+    def _slow_walk(self):
+        async def walk(*args, **kwargs):
+            await oh.asyncio.sleep(1.0)
+            return [[(str(oid), str(val)) for oid, val in row]
+                    for row in REAL_SNMP_TABLE]
+        return walk
+
+    def test_query_printer_version_times_out_not_hangs(self, monkeypatch):
+        import time
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", self._slow_walk())
+        monkeypatch.setattr(oh, "SNMP_DEADLINE", 0.05)
+
+        start = time.monotonic()
+        result = oh._query_printer_version("1.2.3.4", "public", "MAIN")
+        elapsed = time.monotonic() - start
+
+        assert result is None            # a slow walk is not a version answer
+        assert elapsed < 0.5             # it returned via the deadline
+
+    def test_verify_flash_classifies_timeout_as_unverified(self, monkeypatch):
+        monkeypatch.setattr(oh, "_snmp_walk_table", self._slow_walk())
+        monkeypatch.setattr(oh, "SNMP_DEADLINE", 0.05)
+
+        status, actual = oh._verify_flash(
+            "1.2.3.4", "public", "MAIN", "1.24", timeout=0.2, poll=0.01)
+
+        assert status == "unverified"
+        assert status != "mismatch"
+
+
+# ---------------------------------------------------------------------------
+# Packet 4 (P7/R16): the advisory reachability preflight warns, never refuses
+# ---------------------------------------------------------------------------
+
+class TestR16Preflight:
+    """R16: a read-only TCP probe before the download, advisory only."""
+
+    def _arm(self, monkeypatch, tmp_path, upload_result=True):
+        from unittest.mock import MagicMock
+
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_124, None))
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+        sock = MagicMock()
+        sock.__enter__.return_value = sock
+        monkeypatch.setattr(oh.socket, "getaddrinfo",
+                            lambda *a, **k: [(2, 1, 6, '', ('1.2.3.4', 9100))])
+        monkeypatch.setattr(oh.socket, "socket", lambda *a: sock)
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, ip, s: upload_result)
+        monkeypatch.setattr(oh, "_verify_flash",
+                            lambda *a, **k: ("ok", "1.24"))
+        monkeypatch.chdir(tmp_path)
+
+    def test_skipped_under_test(self, monkeypatch, tmp_path):
+        oh.args = _args(test=True)
+        attempts = []
+        monkeypatch.setattr(oh, "_printer_port_open",
+                            lambda *a: attempts.append(a) or True)
+        self._arm(monkeypatch, tmp_path)
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_OK
+        assert attempts == []
+
+    def test_skipped_with_password(self, monkeypatch, tmp_path):
+        from unittest.mock import MagicMock
+
+        oh.args = _args(password="admin")
+        attempts = []
+        monkeypatch.setattr(oh, "_printer_port_open",
+                            lambda *a: attempts.append(a) or True)
+        self._arm(monkeypatch, tmp_path)
+        ftp = MagicMock()
+        monkeypatch.setattr(oh, "FTP", lambda *a, **k: ftp)
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_OK
+        assert attempts == []
+
+    def test_attempted_on_tcp_flash(self, monkeypatch, tmp_path):
+        oh.args = _args()
+        attempts = []
+        monkeypatch.setattr(oh, "_printer_port_open",
+                            lambda *a: attempts.append(a) or True)
+        self._arm(monkeypatch, tmp_path)
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_OK
+        assert len(attempts) == 1
+        assert attempts[0][0] == "1.2.3.4"
+        assert attempts[0][1] == 9100
+        assert attempts[0][2] == oh.PREFLIGHT_TIMEOUT
+
+    def test_refused_preflight_warns_and_continues(
+            self, monkeypatch, tmp_path, capsys):
+        """A closed port warns; it never refuses or aborts the download."""
+        oh.args = _args()
+        monkeypatch.setattr(oh, "_printer_port_open", lambda *a: False)
+        self._arm(monkeypatch, tmp_path, upload_result=False)
+
+        code = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert code == oh.EXIT_UPLOAD
+        assert code == 7
+        assert "1.2.3.4:9100" in out
+        assert "will likely fail" in out
+        assert "retained" in out
+        assert "FTP" in out
+        assert list(tmp_path.rglob("*.djf"))    # the download still happened

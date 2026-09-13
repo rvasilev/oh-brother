@@ -16,7 +16,7 @@ or FTP upload.
   must equal **`37f53a239b86f53d385d45047b8ceb07`**. If that changes, attribution
   was altered — restore it rather than reformatting around it.
 - **License:** GPLv2 (`GPL-2.0-only` in packaging, which matches the header)
-- **Lines:** ~1,480 in a single file (`oh_brother.py`)
+- **Lines:** ~1,550 in a single file (`oh_brother.py`)
 - **Version:** `0.4.0`, read at runtime via `importlib.metadata` (never a
   duplicated literal) with a `0.0.0+source` fallback when run uninstalled
 - **Installed as** the `oh-brother` console script via `pyproject.toml`
@@ -121,7 +121,7 @@ guessed interval.
 | `SnmpError(Exception)` | Carries `exit_code`, so the caller learns *why* rather than getting a traceback |
 | `prompt(msg)` | `input()` only when stdin is a TTY — and nothing in the flash path depends on that no-op any more |
 
-**Module constants (33):** `BROTHER_API_URL`, `BROTHER_SNMP_OID`,
+**Module constants (34):** `BROTHER_API_URL`, `BROTHER_SNMP_OID`,
 `FW_VERSION_SENTINEL`, the `EXIT_*` codes, `UPLOAD_OK`/`UPLOAD_FAILED`/
 `UPLOAD_INCOMPLETE`, `UPLOAD_SOCKET_TIMEOUT`, `UPLOAD_STALL_DEADLINE`,
 `FTP_TIMEOUT`, `SNMP_TIMEOUT`/`SNMP_RETRIES`/`SNMP_DEADLINE`,
@@ -278,7 +278,7 @@ error" when the tool returns structured exit codes.
 
 ## Testing
 
-**159 tests, 27 classes.** Run: `python3 -m pytest tests/ -q`
+**171 tests, 30 classes.** Run: `python3 -m pytest tests/ -q`
 
 | Class | Tests | What it covers |
 |---|---|---|
@@ -309,6 +309,9 @@ error" when the tool returns structured exit codes.
 | `TestFailureTraceback` | 3 | R17: traceback kept, one frame by default, full chain under `--verbose` |
 | `TestFtpUploadOutcome` | 1 | R9: a failed `QUIT` must not discard a completed `STOR` |
 | `TestAsciiOutputPortability` | 2 | P1: operator-facing messages encode as ASCII; a partial upload under an ASCII stdout returns 7, not 1 |
+| `TestStreamGuards` | 6 | Packet 4/P6: a missing stdin reads as "not a terminal" so the consent gate returns `EXIT_REFUSED` (9) not `EXIT_ERROR` (1); `prompt()` and the flush/progress-dot paths survive a `None` stdout |
+| `TestBoundedWalkGap` | 2 | Packet 4/P7: the flash-verification walk is wrapped in a deadline and an unreachable printer reads as `unverified`, never `mismatch` |
+| `TestR16Preflight` | 4 | Packet 4/P7: the TCP reachability probe is skipped under `--test` and `--password`, attempted on a TCP flash, and a refused probe warns and continues without a new exit code |
 
 **Test infrastructure:**
 
