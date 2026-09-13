@@ -6,6 +6,15 @@
 #                                       project's deliberate %-formatting house style
 #   with the three rules below off .... score 47, 20 findings, 0 true positives on
 #                                       existing hand-hardened code
+#   with the 3 source suppressions .... score 60, 17 findings, 0 errors
+#
+# HOW THE GATE ACTUALLY WORKS (read from dist/cli.js; undocumented in --help):
+#   exit 1 if ANY error-severity finding exists, OR if score < failBelow.
+#   So failBelow is inert while any error-severity finding remains, and
+#   `aislop ci --changes` scopes to changed FILES, not changed lines -- a PR that
+#   touches oh_brother.py inherits every finding in that file. Keep the source
+#   free of error-severity findings (the three documented ai-slop hits are
+#   suppressed in the source, each with a reason) or every PR fails the gate.
 # The gate is therefore a ratchet set just under the measured baseline, and CI runs
 # it on CHANGED files only. Do not raise failBelow until the debt below is cleared.
 exclude:

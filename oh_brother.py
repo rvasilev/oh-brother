@@ -434,6 +434,7 @@ def _remove_quietly(path):
     """Best-effort file removal that never masks the original error."""
     try:
         os.remove(path)
+    # aislop-ignore-next-line ai-slop/swallowed-exception -- best-effort removal by design; never masks the original error (docstring above).
     except OSError:
         pass
 
@@ -910,6 +911,7 @@ def update_firmware(cat, version):
       try:
         with sock:
           upload_result = _tcp_upload(filename, args.ip, sock)
+      # aislop-ignore-next-line ai-slop/swallowed-exception -- the handler reports the failure; the post-upload version check is authoritative.
       except OSError as e:
         print('Firmware update aborted due to error while uploading')
         print(e)
@@ -931,6 +933,7 @@ def update_firmware(cat, version):
             ftp.quit()
           except all_errors:
             ftp.close()
+      # aislop-ignore-next-line ai-slop/swallowed-exception -- the handler reports the failure; the post-upload version check is authoritative.
       except all_errors as e:
         print('Firmware update aborted due to error while uploading')
         print(e)
