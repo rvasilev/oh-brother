@@ -83,3 +83,19 @@ Please feel free to submit a pull-request.
 ## Other options
 An alternate bash script for firmware download can be found
 [here](https://cbompart.wordpress.com/2014/05/26/brother-printer-firmware-part-2/).
+
+## AI disclosure
+
+This project is developed with AI assistance. This section documents how, so users and downstream packagers can make informed decisions.
+
+**Tools:** Hermes Agent (DeepSeek v4-pro), Crush CLI — invoked locally with project-scoped rules and memory.
+
+**Used for:** Refactors, multi-file edits, boilerplate (error enums, test scaffolding, doc polish), pysnmp 4.x→7.x migration patterns, exploratory design conversations.
+
+**Not used for:** Engineering decisions, firmware protocol analysis (SNMP/XML/raw-port), git manipulation, real-printer integration tests.
+
+**Verification:** Every AI-assisted change is read, compiled, tested (`python3 -m pytest tests/ -v`, 74 tests), and formatted before commit. Behavioural correctness is verified against real printer SNMP data and Brother API responses, not assumed from model output. Tests are never adjusted to fit AI-generated code; the code is adjusted to fit correct behaviour.
+
+**Limitations:** AI models occasionally produce code that compiles and passes tests but is subtly wrong — particularly around async pysnmp 7.x semantics and TCP sendfile edge cases. The verification workflow catches most of this; it does not catch all of it. Bug reports are welcome and taken seriously.
+
+**Last reviewed:** 30/07/2026
