@@ -107,7 +107,9 @@ anything ambiguous rather than guessing. In particular it will **not**:
     there is no override flag for this;
   * flash at all when stdin is not a terminal and `--yes` was not given, so a
     cron job cannot silently reflash a printer;
-  * download from a host that merely *ends with* an allow-listed domain name.
+  * download from a host that merely *ends with* an allow-listed domain name;
+  * fetch pre-release firmware via `--beta` unless `--yes` is also given, so
+    `--beta` is not its own consent token.
 
 Exit codes are a stable contract for scripting:
 
@@ -115,14 +117,14 @@ Exit codes are a stable contract for scripting:
 |------|---------|
 | 0 | OK — firmware uploaded and verified, or `--test` fetched and verified an image |
 | 1 | ERROR — unexpected internal error |
-| 2 | USAGE — bad arguments |
+| 2 | USAGE — bad arguments (including `-f` without `-c`) |
 | 3 | CURRENT — nothing to do, printer already current (a healthy cron no-op) |
 | 4 | PRINTER — printer unreachable |
 | 5 | VENDOR — Brother API error, or no firmware URL |
 | 6 | DOWNLOAD — download or integrity check failed |
 | 7 | UPLOAD — upload failed, printer rejected the image, or the version did not match |
 | 8 | UNVERIFIED — uploaded, but the printer did not come back in time to confirm |
-| 9 | REFUSED — a safety gate declined to proceed |
+| 9 | REFUSED — a safety gate declined to proceed (unattended flash, downgrade, `--beta` without `--yes`, forced category whose installed version is unknown) |
 | 130 | INTERRUPTED — you pressed Ctrl-C outside the upload window (shell SIGINT convention) |
 
 Exit code **8 is deliberately not a failure**: a Brother laser reboots for a
@@ -154,6 +156,21 @@ That failure is also bounded. SNMP gives up after about ten seconds (5s per
 request, one retry, with a 30s ceiling on the whole discovery stage), so a
 printer that is simply switched off reports **4** promptly instead of hanging
 for minutes. This matters if you drive the tool from cron.
+
+The download is bounded too: it is refused the moment the source sends more
+than its declared `Content-Length`, or more than 64 MB when there is no such
+header, so a broken or hostile mirror cannot fill the disk. Images are written
+to a `.part` file and only moved under their real name once the integrity check
+passes, so a partial download is never mistaken for a usable image.
+
+Between firmware categories the tool polls the printer until it answers again
+rather than sleeping a fixed time — a Brother reboot takes 60–120s, and any
+fixed delay is wrong in both directions. If it never answers, the run stops
+with **4** instead of flashing a printer that is still rebooting.
+
+If something unexpected does fail, the tool now keeps a traceback rather than a
+bare message: the full chain under `--verbose`, otherwise the single frame that
+raised.
 
 # How to use it
 
@@ -217,9 +234,15 @@ Try specifying ``--category`` on the command line.  E.g.:
 
     oh-brother --category MAIN <printer IP>
 
-This targets a specific firmware category. Note that forcing a category no
-longer lets you push an *older* image: a downgrade is refused regardless, and
+This targets a specific firmware category. Note that forcing a category does
+not let you push an *older* image: a downgrade is refused regardless, and
 category selection on its own will not bypass the version check.
+
+`--category` uses the version the printer itself reports, which is what the
+downgrade check compares against. If the printer does not report that category,
+the tool refuses (**9**) rather than proceeding without a check. `--fw-version`
+(`-f`) must be combined with `--category` — on its own it is a usage error
+(**2**) rather than being silently ignored.
 
 ## Submit a PR
 

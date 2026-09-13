@@ -402,8 +402,13 @@ class TestMainSmoke:
         with pytest.raises(SystemExit):
             oh.main()
 
-    def test_main_multiple_firmwares_with_delay(self, monkeypatch):
-        """Multiple firmwares — time.sleep called between updates."""
+    def test_main_multiple_firmwares_waits_for_readiness(self, monkeypatch):
+        """R11: between categories the printer is polled, never blind-slept.
+
+        A fixed sleep is wrong in both directions — too short for a printer
+        that is still rebooting, wasted time when it is already back — so pin
+        both the poll and the absence of the sleep.
+        """
         from unittest.mock import MagicMock
 
         # SNMP data with MAIN + SUB1 firmware
@@ -433,14 +438,59 @@ class TestMainSmoke:
             return oh.EXIT_OK
         monkeypatch.setattr(oh, "update_firmware", fake_update)
 
+        readiness_waits = []
+        def fake_wait(ip, community, timeout=None, poll=None):
+            readiness_waits.append((ip, community))
+            return 1.0
+        monkeypatch.setattr(oh, "_wait_for_printer_ready", fake_wait)
+
         sleep_calls = []
         monkeypatch.setattr(oh.time, "sleep", lambda s: sleep_calls.append(s))
 
         oh.main()
 
         assert called_with == [("MAIN", "1.24"), ("SUB1", "2.10")]
-        # Delay should be inserted between the two updates
-        assert len(sleep_calls) >= 1
+        # Readiness was polled between the two updates...
+        assert readiness_waits == [("1.2.3.4", "public")]
+        # ...and the blind fixed sleep is gone.
+        assert sleep_calls == []
+
+    def test_main_stops_when_printer_never_returns(self, monkeypatch, capsys):
+        """R11: a printer that stays down ends the run instead of being
+        flashed blind."""
+        multi_fw_table = [
+            [("...1", 'MODEL="HL-L2865DW"')],
+            [("...2", 'SPEC="0906"')],
+            [("...6", 'FIRMID="MAIN"')],
+            [("...7", 'FIRMVER="1.24"')],
+            [("...6", 'FIRMID="SUB1"')],
+            [("...7", 'FIRMVER="2.10"')],
+        ]
+
+        async def fake_walk_cmd(*args, **kwargs):
+            table = []
+            for snmp_row in multi_fw_table:
+                varBinds = [(oid, val) for oid, val in snmp_row]
+                table.append([(str(vb[0]), str(vb[1])) for vb in varBinds])
+            return table
+
+        monkeypatch.setattr("builtins.input", lambda _=None: None)
+        monkeypatch.setattr(oh, "_snmp_walk_table", fake_walk_cmd)
+        monkeypatch.setattr("sys.argv", ["oh-brother.py", "1.2.3.4"])
+
+        called_with = []
+        def fake_update(cat, ver):
+            called_with.append((cat, ver))
+            return oh.EXIT_OK
+        monkeypatch.setattr(oh, "update_firmware", fake_update)
+        monkeypatch.setattr(oh, "_wait_for_printer_ready",
+                            lambda ip, community, timeout=None, poll=None: None)
+
+        code = oh.main()
+
+        assert code == oh.EXIT_PRINTER
+        assert called_with == [("MAIN", "1.24")]   # SUB1 is never attempted
+        assert "did not answer" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -655,12 +705,28 @@ class TestDecrementVersion:
     def test_normal_version(self):
         assert oh._decrement_version("1.24") == "1.23"
 
-    def test_zero_minor(self):
-        """Minor version 0 — can't decrement further."""
-        assert oh._decrement_version("1.00") is None
+    def test_zero_padding_is_preserved(self):
+        """R14: '2.10' must decrement to '2.09', not '2.9'.
 
-    def test_three_part_version(self):
-        assert oh._decrement_version("2.10.5") == "2.9.5"
+        The API matches the string it is sent, so dropping the zero asks about
+        a different version rather than a shorter way of writing the same one.
+        """
+        assert oh._decrement_version("2.10.5") == "2.09.5"
+        assert oh._decrement_version("1.05") == "1.04"
+        assert oh._decrement_version("1.24") == "1.23"
+
+    def test_zero_minor_borrows_from_the_major(self):
+        """R14: a printer on a .00 version must still fetch its own firmware."""
+        assert oh._decrement_version("3.00") == "2.99"
+        assert oh._decrement_version("1.00") == "0.99"
+        # A single-digit minor field keeps its own width.
+        assert oh._decrement_version("3.0") == "2.9"
+
+    def test_lowest_version_has_no_fallback(self):
+        assert oh._decrement_version("0.00") is None
+
+    def test_single_part_has_no_minor(self):
+        assert oh._decrement_version("1") is None
 
     def test_non_numeric(self):
         assert oh._decrement_version("abc") is None
@@ -1608,3 +1674,412 @@ class TestSnmpFailureClassification:
 
         assert status == "unverified"
         assert actual is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — R11 readiness polling between categories
+# ---------------------------------------------------------------------------
+
+class TestPrinterReadiness:
+    """R11: wait for the printer to answer, don't guess with a fixed sleep."""
+
+    def test_ready_immediately_does_not_sleep_at_all(self, monkeypatch):
+        monkeypatch.setattr(oh, "_printer_ready", lambda ip, community: True)
+        slept = []
+        monkeypatch.setattr(oh.time, "sleep", lambda s: slept.append(s))
+
+        waited = oh._wait_for_printer_ready("1.2.3.4", "public")
+
+        assert waited is not None
+        assert waited < 1
+        assert slept == []
+
+    def test_polls_until_the_printer_answers(self, monkeypatch):
+        probes = []
+
+        def ready(ip, community):
+            probes.append(1)
+            return len(probes) >= 3
+
+        monkeypatch.setattr(oh, "_printer_ready", ready)
+        monkeypatch.setattr(oh.time, "sleep", lambda s: None)
+
+        waited = oh._wait_for_printer_ready(
+            "1.2.3.4", "public", timeout=30, poll=0)
+
+        assert waited is not None
+        assert len(probes) == 3
+
+    def test_gives_up_at_the_deadline(self, monkeypatch):
+        """Bounded: it stops probing rather than looping forever."""
+        probes = []
+
+        def never(ip, community):
+            probes.append(1)
+            return False
+
+        monkeypatch.setattr(oh, "_printer_ready", never)
+        monkeypatch.setattr(oh.time, "sleep", lambda s: None)
+
+        assert oh._wait_for_printer_ready(
+            "1.2.3.4", "public", timeout=0, poll=0) is None
+        assert len(probes) == 1
+        # The shipped default is a bounded window, not "wait forever".
+        assert oh.READY_TIMEOUT == 300
+
+    def test_snmp_failure_reads_as_not_ready(self, monkeypatch):
+        """An off printer is 'not ready', never an exception."""
+        async def broken(*a, **k):
+            raise oh.SnmpError("no response", oh.EXIT_PRINTER)
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", broken)
+
+        assert oh._printer_ready("1.2.3.4", "public") is False
+
+    def test_answering_printer_reads_as_ready(self, monkeypatch):
+        async def table(*a, **k):
+            return [[("1.2.3", "4")]]
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", table)
+
+        assert oh._printer_ready("1.2.3.4", "public") is True
+
+    def test_empty_walk_reads_as_not_ready(self, monkeypatch):
+        """A reply with no rows is not evidence the printer is up."""
+        async def empty(*a, **k):
+            return []
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", empty)
+
+        assert oh._printer_ready("1.2.3.4", "public") is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — R10 bounded download
+# ---------------------------------------------------------------------------
+
+PATH_XML_R10 = (
+    b'<?xml version="1.0" encoding="UTF-8" ?>'
+    b'<RESPONSEINFO>'
+    b'<FIRMUPDATEINFO>'
+    b'<VERSIONCHECK>0</VERSIONCHECK>'
+    b'<PATH>http://update-akamai.brother.co.jp/CS/D02FZM_124Q_crypt.djf</PATH>'
+    b'</FIRMUPDATEINFO>'
+    b'</RESPONSEINFO>'
+)
+
+
+class TestBoundedDownload:
+    """R10: a body larger than declared, or past the cap, is refused."""
+
+    def _arm(self, monkeypatch, tmp_path, content_length, chunks):
+        """Arms a mocked download. Returns a list recording each read()."""
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        remaining = list(chunks) + [b'']
+        reads = []
+
+        oh.args = SimpleNamespace(
+            beta=False, verbose=False, test=True, yes=True, reflash=True,
+            category=None, fw_version='B0000000000',
+            ip="1.2.3.4", community="public", model=None, password=None,
+        )
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+
+        monkeypatch.setattr(
+            oh, '_http_post',
+            lambda url, data, hdrs, timeout=30: (PATH_XML_R10, None))
+
+        def fake_urlopen(req, timeout=None):
+            m = MagicMock()
+
+            def read(size=-1):
+                reads.append(size)
+                return remaining.pop(0)
+
+            m.headers = {'Content-Length': content_length}
+            m.read.side_effect = read
+            return m
+
+        monkeypatch.setattr(oh.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.chdir(tmp_path)
+        return reads
+
+    def test_more_data_than_content_length_aborts(
+            self, monkeypatch, tmp_path, capsys):
+        """A source that keeps sending past its declared size is refused.
+
+        Asserted on the reason, not merely the exit code: a pre-fix run also
+        ended at EXIT_DOWNLOAD, but only after swallowing the whole stream and
+        failing the integrity check. So the read count is the real evidence —
+        the loop must stop at the first over-long chunk.
+        """
+        reads = self._arm(monkeypatch, tmp_path, '1024', [b'X' * 200000])
+
+        code = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert code == oh.EXIT_DOWNLOAD
+        assert "more data than its declared Content-Length" in out
+        assert len(reads) == 1          # stopped at the first chunk
+        assert not list(tmp_path.rglob('*.djf'))
+        assert not list(tmp_path.rglob('*.part'))
+
+    def test_exceeding_the_hard_cap_aborts(self, monkeypatch, tmp_path, capsys):
+        """With no Content-Length at all the loop is still bounded.
+
+        The body is a plausible size (over the 100 KB integrity floor), so a
+        pre-fix run accepted it and reported success — the cap is the only
+        thing that can fail this test.
+        """
+        monkeypatch.setattr(oh, "DOWNLOAD_HARD_CAP", 4096, raising=False)
+        reads = self._arm(monkeypatch, tmp_path, None, [b'X' * 200000, b'X'])
+
+        code = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert code == oh.EXIT_DOWNLOAD
+        assert "safety cap" in out
+        assert len(reads) == 1
+        assert not list(tmp_path.rglob('*.djf'))
+        assert not list(tmp_path.rglob('*.part'))
+
+    def test_an_honest_download_is_unaffected(self, monkeypatch, tmp_path):
+        """The bound must not break a normal download."""
+        body = b'F' * 200000
+        reads = self._arm(monkeypatch, tmp_path, str(len(body)), [body])
+
+        assert oh.update_firmware("MAIN", "1.24") == oh.EXIT_OK
+        # One data read, plus the EOF read that ends the loop.
+        assert len(reads) == 2
+        retained = list((tmp_path / oh.BACKUP_DIRNAME).rglob('*.djf'))
+        assert len(retained) == 1
+        assert retained[0].stat().st_size == len(body)
+        assert not list(tmp_path.rglob('*.part'))
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — R12 forced category / version flags
+# ---------------------------------------------------------------------------
+
+class TestForcedCategoryFlags:
+    """R12: -f without -c was ignored, and -c alone discarded the installed
+    version that the downgrade check is built on."""
+
+    def _arm_snmp(self, monkeypatch):
+        async def fake_walk_cmd(*args, **kwargs):
+            table = []
+            for snmp_row in REAL_SNMP_TABLE:
+                varBinds = [(oid, val) for oid, val in snmp_row]
+                table.append([(str(vb[0]), str(vb[1])) for vb in varBinds])
+            return table
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", fake_walk_cmd)
+        monkeypatch.setattr("builtins.input", lambda _=None: None)
+
+    def test_fw_version_without_category_is_a_usage_error(self, monkeypatch):
+        """A silently ignored flag is worse than a refusal."""
+        self._arm_snmp(monkeypatch)
+        monkeypatch.setattr(
+            "sys.argv", ["oh-brother.py", "-f", "1.23", "1.2.3.4"])
+
+        with pytest.raises(SystemExit) as exc:
+            oh.main()
+
+        assert exc.value.code == oh.EXIT_USAGE
+
+    def test_forced_category_keeps_the_installed_version(self, monkeypatch):
+        """-c alone must carry the real installed version into the check."""
+        self._arm_snmp(monkeypatch)
+        called_with = []
+        monkeypatch.setattr(
+            oh, "update_firmware",
+            lambda c, v: called_with.append((c, v)) or oh.EXIT_OK)
+        monkeypatch.setattr(
+            "sys.argv", ["oh-brother.py", "-c", "MAIN", "1.2.3.4"])
+
+        oh.main()
+
+        # The SNMP version, not the B0000000000 sentinel.
+        assert called_with == [("MAIN", "1.24")]
+
+    def test_forced_category_unknown_to_snmp_is_refused(self, monkeypatch):
+        """No installed version on record means a downgrade cannot be ruled
+        out, so refuse rather than wave it through."""
+        self._arm_snmp(monkeypatch)
+        called_with = []
+        monkeypatch.setattr(
+            oh, "update_firmware",
+            lambda c, v: called_with.append((c, v)) or oh.EXIT_OK)
+        monkeypatch.setattr(
+            "sys.argv", ["oh-brother.py", "-c", "NOPE", "1.2.3.4"])
+
+        assert oh.main() == oh.EXIT_REFUSED
+        assert called_with == []
+
+    def test_explicit_version_still_overrides(self, monkeypatch):
+        self._arm_snmp(monkeypatch)
+        called_with = []
+        monkeypatch.setattr(
+            oh, "update_firmware",
+            lambda c, v: called_with.append((c, v)) or oh.EXIT_OK)
+        monkeypatch.setattr(
+            "sys.argv",
+            ["oh-brother.py", "-c", "SUB1", "-f", "3.00", "1.2.3.4"])
+
+        oh.main()
+
+        assert called_with == [("SUB1", "3.00")]
+
+    def test_sentinel_is_not_a_version(self):
+        """The default must be recognisable as 'not supplied'."""
+        assert oh.FW_VERSION_SENTINEL == 'B0000000000'
+        assert oh._version_tuple(oh.FW_VERSION_SENTINEL) is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — R13 beta gate
+# ---------------------------------------------------------------------------
+
+class TestBetaGate:
+    """R13: --beta was its own consent token. It is not enough."""
+
+    def test_beta_without_yes_is_refused(self, monkeypatch, capsys):
+        reached = []
+
+        async def walk(*a, **k):
+            reached.append(1)
+            return []
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", walk)
+        monkeypatch.setattr("sys.argv", ["oh-brother.py", "--beta", "1.2.3.4"])
+
+        assert oh.main() == oh.EXIT_REFUSED
+        assert reached == []          # refused before any network work
+        assert "--yes" in capsys.readouterr().out
+
+    def test_beta_with_yes_passes_the_gate(self, monkeypatch):
+        async def unreachable(*a, **k):
+            raise oh.SnmpError("no response", oh.EXIT_PRINTER)
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", unreachable)
+        monkeypatch.setattr(
+            "sys.argv", ["oh-brother.py", "--beta", "--yes", "1.2.3.4"])
+
+        # Past the gate: an absent printer is a different failure.
+        assert oh.main() == oh.EXIT_PRINTER
+
+    def test_beta_with_test_passes_the_gate(self, monkeypatch):
+        """--test cannot write, so inspecting a beta image needs no consent."""
+        async def unreachable(*a, **k):
+            raise oh.SnmpError("no response", oh.EXIT_PRINTER)
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", unreachable)
+        monkeypatch.setattr(
+            "sys.argv", ["oh-brother.py", "--beta", "--test", "1.2.3.4"])
+
+        code = oh.main()
+
+        assert code != oh.EXIT_REFUSED
+        assert code == oh.EXIT_PRINTER
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — R9 the FTP outcome must survive a failed QUIT
+# ---------------------------------------------------------------------------
+
+class TestFtpUploadOutcome:
+    """R9: a completed STOR is a completed transfer, even if QUIT then fails."""
+
+    def test_quit_failure_does_not_lose_a_completed_stor(
+            self, monkeypatch, tmp_path):
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+
+        oh.args = SimpleNamespace(
+            beta=False, verbose=False, test=False, yes=True, reflash=True,
+            category=None, fw_version='B0000000000',
+            ip="1.2.3.4", community="public", password="admin", model=None,
+        )
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+
+        body = b'F' * 200000
+
+        monkeypatch.setattr(
+            oh, '_http_post',
+            lambda url, data, hdrs, timeout=30: (PATH_XML_R10, None))
+
+        def fake_urlopen(req, timeout=None):
+            m = MagicMock()
+            m.headers = {'Content-Length': str(len(body))}
+            m.read.side_effect = [body, b'']
+            return m
+
+        monkeypatch.setattr(oh.urllib.request, "urlopen", fake_urlopen)
+
+        ftp = MagicMock()
+        ftp.quit.side_effect = OSError("connection reset by peer")
+        monkeypatch.setattr(oh, "FTP", lambda *a, **k: ftp)
+
+        verified = []
+        monkeypatch.setattr(
+            oh, "_verify_flash",
+            lambda ip, community, cat, expected:
+                verified.append(expected) or ("ok", "1.24"))
+
+        monkeypatch.chdir(tmp_path)
+
+        code = oh.update_firmware("MAIN", "1.24")
+
+        assert ftp.storbinary.called          # the transfer did happen
+        assert verified == ["1.24"]           # so verification decided the outcome
+        assert code == oh.EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — R17 diagnostic traceback
+# ---------------------------------------------------------------------------
+
+class TestFailureTraceback:
+    """R17: an exit code alone is thin evidence for an unwatched failure."""
+
+    @staticmethod
+    def _explode(monkeypatch):
+        async def boom(*a, **k):
+            raise ValueError("boom")
+
+        monkeypatch.setattr(oh, "_snmp_walk_table", boom)
+
+    def test_traceback_is_printed(self, monkeypatch, capsys):
+        self._explode(monkeypatch)
+        monkeypatch.setattr("sys.argv", ["oh-brother.py", "1.2.3.4"])
+
+        assert oh.main() == oh.EXIT_ERROR
+        err = capsys.readouterr().err
+
+        assert "Traceback" in err
+        # The raising frame's source line, not merely the message.
+        assert 'raise ValueError("boom")' in err
+
+    def test_short_form_shows_the_raising_frame_only(self, monkeypatch, capsys):
+        self._explode(monkeypatch)
+        monkeypatch.setattr("sys.argv", ["oh-brother.py", "1.2.3.4"])
+
+        assert oh.main() == oh.EXIT_ERROR
+        err = capsys.readouterr().err
+
+        assert err.count('File "') == 1
+        assert 'raise ValueError("boom")' in err
+
+    def test_verbose_shows_the_full_chain(self, monkeypatch, capsys):
+        self._explode(monkeypatch)
+        monkeypatch.setattr("sys.argv", ["oh-brother.py", "-v", "1.2.3.4"])
+
+        assert oh.main() == oh.EXIT_ERROR
+        err = capsys.readouterr().err
+
+        assert err.count('File "') >= 2      # full chain, not one frame
+        assert 'raise ValueError("boom")' in err

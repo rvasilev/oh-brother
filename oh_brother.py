@@ -19,6 +19,7 @@ from pysnmp.hlapi.v1arch import (
     ObjectType, ObjectIdentity, SnmpDispatcher,
 )
 import urllib.request, urllib.error, urllib.parse
+import http.client
 import xml.etree.ElementTree as ET
 import argparse
 from importlib.metadata import version as _dist_version, PackageNotFoundError
@@ -29,6 +30,7 @@ import socket
 import ssl
 import os
 import time
+import traceback
 from ftplib import FTP, all_errors
 from urllib.parse import urlparse
 
@@ -66,6 +68,11 @@ BROTHER_API_URL = (
     'kne_bh7_update_nt_ssl/ifax2.asmx/fileUpdate'
 )
 BROTHER_SNMP_OID = '1.3.6.1.4.1.2435.2.4.3.99.3.1.6.1.2'
+
+# -f/--fw-version default. This is a sentinel meaning "not supplied" and never
+# a version: sending it as the installed version is what silently disabled the
+# downgrade check whenever -c was used on its own.
+FW_VERSION_SENTINEL = 'B0000000000'
 
 # Exit-code contract for update_firmware()/main().
 EXIT_OK         = 0
@@ -111,6 +118,20 @@ FLASH_VERIFY_POLL = 5
 
 # Local recovery-image directory.
 BACKUP_DIRNAME = 'firmware_backups'
+
+# Download bounds. The largest image observed for this model is ~15 MB
+# (encrypted D02 firmware), so the hard cap is generous headroom rather than a
+# tight limit — it exists to bound a broken or hostile source, not a real
+# download. Without it the write loop runs until the server sends EOF or the
+# disk fills, and a truncated artifact is not distinguishable by name alone.
+DOWNLOAD_CHUNK = 102400                 # bytes per read()
+DOWNLOAD_HARD_CAP = 64 * 1024 * 1024    # 64 MB
+
+# Readiness window used between firmware categories (seconds). A Brother laser
+# reboots after a flash and needs 60-120s+ to come back, so this is polled
+# rather than slept out.
+READY_TIMEOUT = 300
+READY_POLL = 5
 
 
 def parse_snmp_table(table, verbose=False):
@@ -219,7 +240,7 @@ parser.add_argument('-m', '--model',
                     help = 'Force a specific printer model')
 parser.add_argument('-C', '--community', default = 'public',
                     help = 'SNMP community (default: %(default)s)')
-parser.add_argument('-f', '--fw-version', default = 'B0000000000',
+parser.add_argument('-f', '--fw-version', default = FW_VERSION_SENTINEL,
                     help = 'Force a specific firmware version, must be used '
                     'with --category')
 parser.add_argument('-t', '--test', action = 'store_true',
@@ -250,18 +271,32 @@ def _decrement_version(version_str):
     
     When the API returns VCHECK=1 (already current), retrying with
     an older version forces it to return the current firmware PATH.
-    Example: '1.24' -> '1.23', '2.10' -> '2.09'.
+    Zero-padding is preserved, because the API matches the string it is sent:
+    '2.10' -> '2.09' (not '2.9'). A minor of 0 borrows from the major
+    ('3.00' -> '2.99'), since a printer whose installed version ends in .00
+    would otherwise never be able to fetch its own firmware at all.
+
+    The decremented value is only ever used to *ask*: whatever artifact it
+    yields is still subject to the downgrade check before anything is written.
     
     Returns: str or None if version can't be parsed/decremented.
     """
     try:
-        parts = version_str.split('.')
-        if len(parts) >= 2:
-            minor = int(parts[1])
-            if minor > 0:
-                parts[1] = str(minor - 1)
-                return '.'.join(parts)
-    except (ValueError, IndexError):
+        parts = str(version_str).split('.')
+        if len(parts) < 2:
+            return None
+        minor_text = parts[1]
+        minor = int(minor_text)
+        if minor > 0:
+            parts[1] = '%0*d' % (len(minor_text), minor - 1)
+            return '.'.join(parts)
+        # Minor is 0 — borrow from the major, keeping the minor field's width.
+        major = int(parts[0])
+        if major > 0:
+            parts[0] = str(major - 1)
+            parts[1] = '9' * len(minor_text)
+            return '.'.join(parts)
+    except (ValueError, IndexError, TypeError):
         pass
     return None
 
@@ -507,6 +542,44 @@ def _verify_flash(ip, community, cat, expected_version,
         time.sleep(poll)
 
 
+def _printer_ready(ip, community):
+    """True when the printer answers SNMP, i.e. it has finished rebooting.
+
+    Deliberately read-only: a walk cannot leave anything half-written on the
+    printer, which matters because this runs immediately after a flash.
+    """
+    try:
+        table = asyncio.run(asyncio.wait_for(
+            _snmp_walk_table(ip, community, BROTHER_SNMP_OID), SNMP_DEADLINE,
+        ))
+    except Exception:
+        return False
+    return bool(table)
+
+
+def _wait_for_printer_ready(ip, community, timeout=None, poll=None):
+    """Block until the printer answers SNMP again.
+
+    A Brother laser reboots after a flash and needs 60-120s+ to come back. A
+    fixed sleep is wrong in both directions: too short and the next category
+    hits a printer that is still rebooting, too long and every multi-category
+    run pays for the worst case. Poll the printer's own readiness instead,
+    bounded by a deadline.
+
+    Returns: seconds waited (float), or None if it never came back.
+    """
+    timeout = READY_TIMEOUT if timeout is None else timeout
+    poll = READY_POLL if poll is None else poll
+    start = time.monotonic()
+    deadline = start + timeout
+    while True:
+        if _printer_ready(ip, community):
+            return time.monotonic() - start
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(poll)
+
+
 def _http_post(url, data, hdrs, timeout=30):
     """POST data to a URL with comprehensive error handling.
     
@@ -687,16 +760,41 @@ def update_firmware(cat, version):
     return EXIT_DOWNLOAD
 
   content_length = response.headers.get('Content-Length')
+  declared = None
+  if content_length is not None:
+    try:
+      declared = int(content_length)
+    except (TypeError, ValueError):
+      declared = None
 
+  written = 0
   try:
     with open(part_filename, 'wb') as f:
       while True:
-        block = response.read(102400)
+        block = response.read(DOWNLOAD_CHUNK)
         if not block: break
         f.write(block)
+        written += len(block)
+        # R10: bound the loop. Without this a broken or hostile source writes
+        # until the disk fills, and a truncated artifact cannot be told from a
+        # complete one by its name.
+        if written > DOWNLOAD_HARD_CAP:
+          print()
+          print('Error: firmware download exceeded the %d MB safety cap '
+                '(%d bytes received) — aborting.'
+                % (DOWNLOAD_HARD_CAP // (1024 * 1024), written))
+          _remove_quietly(part_filename)
+          return EXIT_DOWNLOAD
+        if declared is not None and written > declared:
+          print()
+          print('Error: firmware download sent more data than its declared '
+                'Content-Length (%d declared, %d received) — aborting.'
+                % (declared, written))
+          _remove_quietly(part_filename)
+          return EXIT_DOWNLOAD
         sys.stdout.write('.')
         sys.stdout.flush()
-  except OSError as e:
+  except (OSError, http.client.HTTPException) as e:
     print()
     print('Error: firmware download interrupted — %s' % e)
     _remove_quietly(part_filename)
@@ -775,12 +873,21 @@ def update_firmware(cat, version):
     else:
       try:
         ftp = FTP(args.ip, user = args.password, timeout = FTP_TIMEOUT) # Yes send password as user
-        with open(filename, 'rb') as fw:
-          ftp.storbinary('STOR ' + os.path.basename(filename), fw)
-        ftp.quit()
-        # A completed STOR proves the transfer only, not that the printer
-        # accepted the image; the verification step below is authoritative.
-        upload_result = UPLOAD_OK
+        try:
+          with open(filename, 'rb') as fw:
+            ftp.storbinary('STOR ' + os.path.basename(filename), fw)
+          # A completed STOR proves the transfer only, not that the printer
+          # accepted the image; the verification step below is authoritative.
+          upload_result = UPLOAD_OK
+        finally:
+          # R9: a failing QUIT must not downgrade a completed STOR — the
+          # transfer has already happened, and the version check decides the
+          # outcome. Reporting a false upload failure here would send the user
+          # chasing a printer that is actually fine.
+          try:
+            ftp.quit()
+          except all_errors:
+            ftp.close()
       except all_errors as e:
         print('Firmware update aborted due to error while uploading')
         print(e)
@@ -891,6 +998,22 @@ def main() -> int:
     try:
         args = parser.parse_args()
 
+        # R12: -f is only meaningful with -c. Without a category there is
+        # nothing to apply the version to, and the flag used to be silently
+        # ignored — the user believed they had forced a version and had not.
+        if args.fw_version != FW_VERSION_SENTINEL and not args.category:
+            parser.error('-f/--fw-version requires -c/--category '
+                         '(there is no category to apply it to)')
+
+        # R13: --beta pulls pre-release firmware from the vendor, so it needs
+        # explicit consent rather than being its own opt-in. --test cannot
+        # write to the printer, so it stays usable for inspecting a beta image.
+        if args.beta and not args.yes and not args.test:
+            print('REFUSING: --beta downloads pre-release firmware.')
+            print('Pass --yes to confirm, or --test to fetch it without '
+                  'flashing.')
+            return EXIT_REFUSED
+
         # Provide information about requirements
         print('You may need to check the following in the printer\'s configuration:')
         print('  - SNMP service is enabled (for fetching model and versions)')
@@ -941,7 +1064,26 @@ def main() -> int:
 
         # Override category and version
         if args.category:
-            firmInfo = [{'cat': args.category, 'version': args.fw_version}]
+            # R12: forcing a category must not discard the installed version,
+            # because the downgrade check is built on it. Sending the sentinel
+            # as the "installed" version silently disabled that check.
+            installed_for_cat = None
+            for entry in firmInfo:
+                if entry['cat'] == args.category:
+                    installed_for_cat = entry['version']
+                    break
+            if args.fw_version != FW_VERSION_SENTINEL:
+                forced_version = args.fw_version   # the user asserted it
+            elif installed_for_cat is not None:
+                forced_version = installed_for_cat
+            else:
+                print('REFUSING: -c %s was given but the printer does not '
+                      'report that category, so a downgrade cannot be ruled '
+                      'out.' % args.category)
+                print('Pass -f <version> to state the installed version '
+                      'explicitly.')
+                return EXIT_REFUSED
+            firmInfo = [{'cat': args.category, 'version': forced_version}]
 
         # Print SNMP info
         print()
@@ -960,7 +1102,8 @@ def main() -> int:
         if num_firmwares > 1:
             print('WARNING: %d firmware updates pending. '
                   'Printer may reboot between updates.' % num_firmwares)
-            print('A 30-second delay will be inserted between each update.')
+            print('The printer will be polled until it answers again between '
+                  'updates (up to %d seconds).' % READY_TIMEOUT)
             if not args.yes:
                 prompt('Press Ctrl-C to abort or Enter to continue...')
 
@@ -969,9 +1112,22 @@ def main() -> int:
             code = update_firmware(entry['cat'], entry['version'])
             codes.append(code)
             if code == EXIT_OK and i < num_firmwares - 1:
-                print('Waiting 30 seconds for printer to stabilize...')
+                # R11: the next category needs a printer that has finished
+                # rebooting, so wait for it to answer rather than guessing
+                # with a fixed sleep.
+                print('Waiting for the printer to come back before the next '
+                      'update...')
                 sys.stdout.flush()
-                time.sleep(30)
+                waited = _wait_for_printer_ready(
+                    args.ip, getattr(args, 'community', 'public'))
+                if waited is None:
+                    print('The printer did not answer within %d seconds.'
+                          % READY_TIMEOUT)
+                    print('Skipping the remaining %d update(s) — re-run once '
+                          'it is back.' % (num_firmwares - i - 1))
+                    codes.append(EXIT_PRINTER)
+                    break
+                print('Printer is back (%.0fs).' % waited)
 
         # Worst-wins: an upload failure must never be hidden behind another
         # category's success.
@@ -1009,8 +1165,16 @@ def main() -> int:
         print('Interrupted.')
         return EXIT_INTERRUPTED
 
-    except Exception as e:
-        print(e, file=sys.stderr)
+    except Exception:
+        # R17: an exit code on its own is thin evidence for a failure nobody
+        # watched. --verbose gets the full traceback; otherwise just the frame
+        # that raised. Note the negative limit: a positive one prints the
+        # *outermost* frame (main's handler), which says nothing useful.
+        try:
+            verbose = bool(args.verbose)
+        except NameError:
+            verbose = False
+        traceback.print_exc(limit=None if verbose else -1)
         return EXIT_ERROR
 
 
