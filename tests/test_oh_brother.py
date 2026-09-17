@@ -1053,6 +1053,16 @@ XML_UPDATE_120 = (
     b'</RESPONSEINFO>'
 )
 
+XML_UPDATE_126 = (
+    b'<?xml version="1.0" encoding="UTF-8" ?>'
+    b'<RESPONSEINFO>'
+    b'<FIRMUPDATEINFO>'
+    b'<VERSIONCHECK>0</VERSIONCHECK>'
+    b'<PATH>http://update-akamai.brother.co.jp/CS/D02FZM_126R_crypt.djf</PATH>'
+    b'</FIRMUPDATEINFO>'
+    b'</RESPONSEINFO>'
+)
+
 
 def _args(**overrides):
     from types import SimpleNamespace
@@ -1373,18 +1383,26 @@ class TestFlashHardening:
 
     def test_post_upload_version_mismatch_fails(
             self, monkeypatch, tmp_path, capsys):
-        """A completed read with the wrong version is a real failure."""
+        """A reboot back onto the wrong version is a real failure.
+
+        Mismatch means the printer went down for the flash and came back on
+        something else. The reading has to follow a reboot: the old firmware
+        answering SNMP *before* the flash starts is not evidence of anything.
+        """
         oh.args = _args()
         oh.model = "HL-L2865DW"
         oh.spec = "0906"
 
+        monkeypatch.setattr(oh, "FLASH_VERIFY_POLL", 0)
+        monkeypatch.setattr(oh.time, "sleep", lambda s: None)
         monkeypatch.setattr(oh, "_http_post",
                             lambda *a, **k: (XML_UPDATE_124, None))
         monkeypatch.setattr(oh.urllib.request, "urlopen",
                             lambda *a, **k: _download_response())
         monkeypatch.setattr(oh, "_tcp_upload", lambda f, sock: True)
+        reads = iter(["1.20", None, "1.20"])
         monkeypatch.setattr(oh, "_query_printer_version",
-                            lambda ip, community, cat: "1.20")
+                            lambda ip, community, cat: next(reads))
         _fake_tcp_socket(monkeypatch)
         monkeypatch.chdir(tmp_path)
 
@@ -1394,6 +1412,39 @@ class TestFlashHardening:
         assert result == oh.EXIT_UPLOAD
         assert "expected=1.24 actual=1.20" in out
         assert list(tmp_path.rglob("*.djf"))  # retained on real failure
+
+    def test_post_upload_stalled_when_printer_never_restarts(
+            self, monkeypatch, tmp_path, capsys):
+        """A printer that never goes down never started the update.
+
+        This is the observable signature of a model that accepts a raw-port
+        firmware job and silently discards it: the transfer completes, the
+        printer stays up, and the version never changes.
+        """
+        oh.args = _args()
+        oh.model = "HL-L2865DW"
+        oh.spec = "0906"
+
+        monkeypatch.setattr(oh, "FLASH_REBOOT_GRACE", 0)
+        monkeypatch.setattr(oh, "FLASH_VERIFY_POLL", 0)
+        monkeypatch.setattr(oh.time, "sleep", lambda s: None)
+        monkeypatch.setattr(oh, "_http_post",
+                            lambda *a, **k: (XML_UPDATE_126, None))
+        monkeypatch.setattr(oh.urllib.request, "urlopen",
+                            lambda *a, **k: _download_response())
+        monkeypatch.setattr(oh, "_tcp_upload", lambda f, sock: True)
+        monkeypatch.setattr(oh, "_query_printer_version",
+                            lambda ip, community, cat: "1.24")
+        _fake_tcp_socket(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+
+        result = oh.update_firmware("MAIN", "1.24")
+        out = capsys.readouterr().out
+
+        assert result == oh.EXIT_UPLOAD
+        assert "did NOT start" in out
+        assert "silently discarded" in out
+        assert list(tmp_path.rglob("*.djf"))  # retained, nothing was written
 
     def test_post_upload_unverifiable_is_not_failure(
             self, monkeypatch, tmp_path, capsys):
@@ -1709,6 +1760,41 @@ class TestSnmpFailureClassification:
 
         assert status == "unverified"
         assert actual is None
+
+    def test_verify_flash_does_not_trust_the_pre_reboot_read(
+            self, monkeypatch):
+        """The old firmware answering before the flash is not a verdict.
+
+        A printer that is about to update correctly keeps answering SNMP with
+        the running version for the first seconds after the upload. Reading
+        that as final reported a false failure on every successful flash.
+        """
+        monkeypatch.setattr(oh, "FLASH_VERIFY_POLL", 0)
+        monkeypatch.setattr(oh.time, "sleep", lambda s: None)
+        reads = iter(["1.24", "1.24", None, None, "1.26"])
+        monkeypatch.setattr(oh, "_query_printer_version",
+                            lambda ip, community, cat: next(reads))
+
+        status, actual = oh._verify_flash("1.2.3.4", "public", "MAIN", "1.26")
+
+        assert (status, actual) == ("ok", "1.26")
+
+    def test_verify_flash_stalled_when_the_printer_never_goes_down(
+            self, monkeypatch):
+        """Still answering on the old version past the grace window.
+
+        Nothing was written, so this must not be reported as a flash that
+        failed to verify — the printer never started.
+        """
+        monkeypatch.setattr(oh, "FLASH_REBOOT_GRACE", 0)
+        monkeypatch.setattr(oh, "FLASH_VERIFY_POLL", 0)
+        monkeypatch.setattr(oh.time, "sleep", lambda s: None)
+        monkeypatch.setattr(oh, "_query_printer_version",
+                            lambda ip, community, cat: "1.24")
+
+        status, actual = oh._verify_flash("1.2.3.4", "public", "MAIN", "1.26")
+
+        assert (status, actual) == ("stalled", "1.24")
 
 
 # ---------------------------------------------------------------------------

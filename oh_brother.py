@@ -122,6 +122,14 @@ SNMP_DEADLINE = 30
 FLASH_VERIFY_TIMEOUT = 300
 FLASH_VERIFY_POLL = 5
 
+# Grace window (seconds) for the printer to *start* the update. The running
+# firmware answers SNMP in the seconds before a flash begins, so a read taken
+# straight after the upload reports the old version even when everything is
+# going correctly. A Brother drops off the network within seconds of accepting
+# an image, so a printer that keeps answering with the old version for this
+# whole window never started the update — a different, actionable diagnosis.
+FLASH_REBOOT_GRACE = 60
+
 # Local recovery-image directory. BACKUP_DIR_ENV relocates the root under
 # which BACKUP_DIRNAME is created. It is an environment variable rather than a
 # CLI flag so the command-line surface stays frozen; unset means the current
@@ -701,6 +709,20 @@ def _interrupt_during_verification(path, expected):
     )
 
 
+def _stalled_message(path, actual):
+    """The printer took the bytes but never started the update."""
+    return (
+        'The printer accepted the transfer but never stopped running the\n'
+        'installed version %s, so it never started the update: the image was\n'
+        'ignored and nothing was written. Do NOT power-cycle it to "help" --\n'
+        'there is no half-written image to clear.\n'
+        'Not every Brother model accepts a firmware image over the raw port\n'
+        '(9100); on those the upload completes and is silently discarded.\n'
+        'Use the vendor updater instead. Image retained at: %s'
+        % (actual, os.path.abspath(path))
+    )
+
+
 def _query_printer_version(ip, community, cat):
     """Read one firmware category's version with a single SNMP walk.
 
@@ -721,33 +743,51 @@ def _query_printer_version(ip, community, cat):
 
 
 def _verify_flash(ip, community, cat, expected_version,
-                  timeout=None, poll=None):
+                  timeout=None, poll=None, grace=None):
     """Poll the printer until it is back, then compare firmware versions.
 
     A Brother laser reboots after a flash, so readiness is polled within a
     bounded window before the version is read.
 
+    The *old* firmware answers SNMP during the seconds before the flash
+    starts, so a single read taken straight after the upload reports the old
+    version even on a printer that is about to update correctly. Wait for the
+    printer to stop answering — the reboot — before trusting a version, and
+    give up on the grace window if it never goes down.
+
     Returns (status, actual) where status is one of:
         'ok'         — a completed read matched the expected version
-        'mismatch'   — a completed read disagreed with the expected version
+        'mismatch'   — the printer rebooted and came back on the old version
+        'stalled'    — the printer never went down within the grace window and
+                       still reports the old version, so the image was ignored
+                       and nothing was written
         'unverified' — the printer did not come back within the deadline
     """
     if timeout is None:
         timeout = FLASH_VERIFY_TIMEOUT
     if poll is None:
         poll = FLASH_VERIFY_POLL
+    if grace is None:
+        grace = FLASH_REBOOT_GRACE
 
     expected = _version_tuple(expected_version)
     if expected is None:
         return 'unverified', None
 
     deadline = time.monotonic() + timeout
+    grace_deadline = time.monotonic() + grace
+    went_down = False
     while True:
         actual = _query_printer_version(ip, community, cat)
-        if actual is not None:
-            if _version_tuple(actual) == expected:
-                return 'ok', actual
+        if actual is None:
+            # SNMP silence is the printer restarting into the new image.
+            went_down = True
+        elif _version_tuple(actual) == expected:
+            return 'ok', actual
+        elif went_down:
             return 'mismatch', actual
+        elif time.monotonic() >= grace_deadline:
+            return 'stalled', actual
         if time.monotonic() >= deadline:
             return 'unverified', actual
         time.sleep(poll)
@@ -1297,6 +1337,12 @@ def update_firmware(cat, version):
     print('expected=%s actual=%s' % (artifact_version, actual))
     print(_retained_message(filename))
     return EXIT_UNVERIFIED
+
+  if status == 'stalled':
+    print('Firmware update did NOT start: the printer kept answering on '
+          'version %s.' % actual)
+    print(_stalled_message(filename, actual))
+    return EXIT_UPLOAD
 
   if status == 'mismatch':
     print('Firmware verification FAILED: expected=%s actual=%s'
