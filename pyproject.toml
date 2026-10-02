@@ -32,7 +32,16 @@ py-modules = ["oh_brother"]
 # Pin the lint gate so it does not drift with a future ruff default change.
 target-version = "py310"
 line-length = 100
-extend-exclude = ["firmware_backups", "build"]
+# Markdown is excluded: docs/ holds dated records and AGENTS.md quotes code
+# verbatim, and `ruff format` rewrites embedded python blocks (and their
+# quotes), corrupting a historical record. Python files only.
+extend-exclude = ["firmware_backups", "build", "*.md"]
+
+[tool.ruff.format]
+# Upstream (and this fork) use single quotes: 252 of 277 string literals were
+# single-quoted before formatting. ruff's default "double" rewrites all of them
+# and breaks house style; "single" normalises the stragglers instead.
+quote-style = "single"
 
 [tool.ruff.lint]
 # ruff's default rule set, minus the project's deliberate house style. Each

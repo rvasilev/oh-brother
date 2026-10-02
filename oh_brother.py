@@ -50,7 +50,7 @@ from pysnmp.hlapi.v1arch import (
 # is a spelling issue crime committed by original vendor parts
 # and thus expected to remain exactly as wrongly written.
 # Thus it obviously should *not* be "corrected" here.
-reqInfo = '''
+reqInfo = """
 <REQUESTINFO>
   <FIRMUPDATETOOLINFO>
     <FIRMCATEGORY></FIRMCATEGORY>
@@ -71,12 +71,9 @@ reqInfo = '''
     <NEEDRESPONSE>1</NEEDRESPONSE>
   </FIRMUPDATEINFO>
 </REQUESTINFO>
-'''
+"""
 
-BROTHER_API_URL = (
-    'https://firmverup.brother.co.jp/'
-    'kne_bh7_update_nt_ssl/ifax2.asmx/fileUpdate'
-)
+BROTHER_API_URL = 'https://firmverup.brother.co.jp/kne_bh7_update_nt_ssl/ifax2.asmx/fileUpdate'
 BROTHER_SNMP_OID = '1.3.6.1.4.1.2435.2.4.3.99.3.1.6.1.2'
 
 # -f/--fw-version default. This is a sentinel meaning "not supplied" and never
@@ -85,17 +82,17 @@ BROTHER_SNMP_OID = '1.3.6.1.4.1.2435.2.4.3.99.3.1.6.1.2'
 FW_VERSION_SENTINEL = 'B0000000000'
 
 # Exit-code contract for update_firmware()/main().
-EXIT_OK         = 0
-EXIT_ERROR      = 1
-EXIT_USAGE      = 2
-EXIT_CURRENT    = 3
-EXIT_PRINTER    = 4
-EXIT_VENDOR     = 5
-EXIT_DOWNLOAD   = 6
-EXIT_UPLOAD     = 7
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+EXIT_CURRENT = 3
+EXIT_PRINTER = 4
+EXIT_VENDOR = 5
+EXIT_DOWNLOAD = 6
+EXIT_UPLOAD = 7
 EXIT_UNVERIFIED = 8
-EXIT_REFUSED    = 9
-EXIT_INTERRUPTED = 130    # Ctrl-C outside the upload window (shell SIGINT convention)
+EXIT_REFUSED = 9
+EXIT_INTERRUPTED = 130  # Ctrl-C outside the upload window (shell SIGINT convention)
 
 # Upload outcome classification (see _tcp_upload / update_firmware).
 # A boolean True still means a clean transfer; UPLOAD_INCOMPLETE marks a
@@ -105,9 +102,9 @@ UPLOAD_FAILED = False
 UPLOAD_INCOMPLETE = 'incomplete'
 
 # Upload timing budgets (seconds).
-UPLOAD_SOCKET_TIMEOUT = 300       # bounds one sendfile() call
-UPLOAD_STALL_DEADLINE = 3600      # bounds the whole transfer
-FTP_TIMEOUT = 30                  # bounds a hung FTP session
+UPLOAD_SOCKET_TIMEOUT = 300  # bounds one sendfile() call
+UPLOAD_STALL_DEADLINE = 3600  # bounds the whole transfer
+FTP_TIMEOUT = 30  # bounds a hung FTP session
 
 # HTTP client timeout (seconds) for the vendor API and the firmware download.
 HTTP_TIMEOUT = 30
@@ -151,12 +148,12 @@ VALIDATOR_SUFFIX = '.validator'
 # tight limit — it exists to bound a broken or hostile source, not a real
 # download. Without it the write loop runs until the server sends EOF or the
 # disk fills, and a truncated artifact is not distinguishable by name alone.
-DOWNLOAD_CHUNK = 102400                 # bytes per read()
-DOWNLOAD_HARD_CAP = 64 * 1024 * 1024    # 64 MB
+DOWNLOAD_CHUNK = 102400  # bytes per read()
+DOWNLOAD_HARD_CAP = 64 * 1024 * 1024  # 64 MB
 
 # Smallest plausible Brother firmware image. Anything smaller is an error
 # page or a truncated transfer, not a firmware blob.
-MIN_FIRMWARE_SIZE = 102400              # 100KB — no real Brother firmware is smaller
+MIN_FIRMWARE_SIZE = 102400  # 100KB — no real Brother firmware is smaller
 
 # Readiness window used between firmware categories (seconds). A Brother laser
 # reboots after a flash and needs 60-120s+ to come back, so this is polled
@@ -171,19 +168,19 @@ PREFLIGHT_TIMEOUT = 5
 
 def parse_snmp_table(table, verbose=False):
     """Parse SNMP walk result table into model/serial/spec/firmware info.
-    
+
     table: list of list of (oid, value) tuples from SNMP walk
     Returns: dict with keys: serial, model, spec, firmwares (list of {cat, version})
     """
     if verbose:
         print(table)
-    
+
     serial = None
     model = None
     spec = None
     firmId = None
     firmwares = {}
-    
+
     for row in table:
         for name, value in row:
             value = str(value)
@@ -200,7 +197,7 @@ def parse_snmp_table(table, verbose=False):
                     firmId = value
                 if name == 'FIRMVER' and firmId and value:
                     firmwares[firmId] = {'cat': firmId, 'version': value}
-    
+
     return {
         'serial': serial,
         'model': model,
@@ -211,88 +208,97 @@ def parse_snmp_table(table, verbose=False):
 
 def build_firmware_xml(model, spec, category, version, beta=False):
     """Build the XML request body for Brother's firmware update API.
-    
+
     Returns: bytes (UTF-8 encoded XML)
     """
     # Use the module-level reqInfo template
     xml = ET.ElementTree(ET.fromstring(reqInfo))
-    
+
     toolInfo = xml.find('FIRMUPDATETOOLINFO')
     toolInfo.find('FIRMCATEGORY').text = category if category != 'FIRM' else 'MAIN'
     toolInfo.find('INSPECTMODE').text = '1' if beta else '0'
-    
+
     modelInfo = xml.find('FIRMUPDATEINFO/MODELINFO')
     modelInfo.find('NAME').text = model
     modelInfo.find('SPEC').text = spec
-    
+
     firm = modelInfo.find('FIRMINFO/FIRM')
     ET.SubElement(firm, 'ID').text = category if category != 'IFAX' else 'MAIN'
     ET.SubElement(firm, 'VERSION').text = version
-    
+
     return ET.tostring(xml.getroot(), encoding='utf8')
 
 
 def parse_brother_response(xml_bytes):
     """Parse Brother firmware API XML response.
-    
+
     Returns: dict with keys:
         version_check: str or None — '1' means up to date
         firmware_url: str or None — download URL if update available
     """
-    
+
     try:
         xml = ET.fromstring(xml_bytes)
     except ET.ParseError as e:
         return {'version_check': None, 'firmware_url': None, 'parse_error': str(e)}
-    
+
     version_check = xml.find('FIRMUPDATEINFO/VERSIONCHECK')
     version_check = version_check.text if version_check is not None else None
-    
+
     firmware_url = xml.find('FIRMUPDATEINFO/PATH')
     firmware_url = firmware_url.text if firmware_url is not None else None
-    
+
     return {'version_check': version_check, 'firmware_url': firmware_url}
 
 
 def _version():
     try:
-        return _dist_version("oh-brother")
+        return _dist_version('oh-brother')
     except (PackageNotFoundError, ImportError):
-        return "0.0.0+source"
+        return '0.0.0+source'
+
 
 # Parse args
 usage = '%(prog)s [OPTIONS] <printer IP address>'
 description = 'A platform independent tool for updating Brother firmwares'
 
-parser = argparse.ArgumentParser(usage = usage, description = description)
+parser = argparse.ArgumentParser(usage=usage, description=description)
 
-parser.add_argument('ip', metavar = 'IP', help = 'printer IP address')
-parser.add_argument('-v', '--verbose', action = 'store_true',
-                    help = 'Verbose output')
-parser.add_argument('-c', '--category',
-                    help = 'Force a specific firmware category')
-parser.add_argument('-m', '--model',
-                    help = 'Force a specific printer model')
-parser.add_argument('-C', '--community', default = 'public',
-                    help = 'SNMP community (default: %(default)s)')
-parser.add_argument('-f', '--fw-version', default = FW_VERSION_SENTINEL,
-                    help = 'Force a specific firmware version, must be used '
-                    'with --category')
-parser.add_argument('-t', '--test', action = 'store_true',
-                    help = 'Test only, don\'t do upgrades')
-parser.add_argument('--beta', action = 'store_true',
-                    help = 'Download the latest beta firmware instead of the '
-                    'default stable version.')
-parser.add_argument('-p', '--password',
-                    help = 'Upload firmware via FTP using printer admin password '
-                    '(default is passwordless upload via TCP port 9100)')
-parser.add_argument('-y', '--yes', action = 'store_true',
-                    help = 'Skip all confirmation prompts (non-interactive mode)')
-parser.add_argument('--reflash', action = 'store_true',
-                    help = 'Re-apply the current firmware version even when the '
-                    'printer already reports it as up to date')
-parser.add_argument('--version', action = 'version',
-                    version = '%(prog)s ' + _version())
+parser.add_argument('ip', metavar='IP', help='printer IP address')
+parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
+parser.add_argument('-c', '--category', help='Force a specific firmware category')
+parser.add_argument('-m', '--model', help='Force a specific printer model')
+parser.add_argument(
+    '-C', '--community', default='public', help='SNMP community (default: %(default)s)'
+)
+parser.add_argument(
+    '-f',
+    '--fw-version',
+    default=FW_VERSION_SENTINEL,
+    help='Force a specific firmware version, must be used with --category',
+)
+parser.add_argument('-t', '--test', action='store_true', help="Test only, don't do upgrades")
+parser.add_argument(
+    '--beta',
+    action='store_true',
+    help='Download the latest beta firmware instead of the default stable version.',
+)
+parser.add_argument(
+    '-p',
+    '--password',
+    help='Upload firmware via FTP using printer admin password '
+    '(default is passwordless upload via TCP port 9100)',
+)
+parser.add_argument(
+    '-y', '--yes', action='store_true', help='Skip all confirmation prompts (non-interactive mode)'
+)
+parser.add_argument(
+    '--reflash',
+    action='store_true',
+    help='Re-apply the current firmware version even when the '
+    'printer already reports it as up to date',
+)
+parser.add_argument('--version', action='version', version='%(prog)s ' + _version())
 
 
 def _isatty(stream):
@@ -326,7 +332,7 @@ def prompt(msg):
 
 def _decrement_version(version_str):
     """Decrement the minor version number for API fallback.
-    
+
     When the API returns VCHECK=1 (already current), retrying with
     an older version forces it to return the current firmware PATH.
     Zero-padding is preserved, because the API matches the string it is sent:
@@ -336,7 +342,7 @@ def _decrement_version(version_str):
 
     The decremented value is only ever used to *ask*: whatever artifact it
     yields is still subject to the downgrade check before anything is written.
-    
+
     Returns: str or None if version can't be parsed/decremented.
     """
     try:
@@ -396,24 +402,24 @@ def _parse_artifact_version(filename):
 
 def _validate_firmware_url(url):
     """Validate firmware download URL for safety.
-    
+
     Checks: non-empty, http/https scheme, known Brother CDN domain,
     firmware file extension (.djf or .upd).
-    
+
     Returns: (is_valid: bool, error_message: str or None)
     """
     if not url:
-        return False, "empty URL"
+        return False, 'empty URL'
     parsed = urlparse(url)
     if parsed.scheme not in ('http', 'https'):
-        return False, "unexpected scheme: %s" % parsed.scheme
+        return False, 'unexpected scheme: %s' % parsed.scheme
     allowed_domains = ('brother.co.jp', 'brother.com', 'brother.eu')
     host = parsed.hostname or ''
     if not any(host == d or host.endswith('.' + d) for d in allowed_domains):
-        return False, "unexpected domain: %s" % parsed.netloc
+        return False, 'unexpected domain: %s' % parsed.netloc
     path = parsed.path.lower()
     if not path.endswith(('.djf', '.upd')):
-        return False, "unexpected file type: %s" % parsed.path
+        return False, 'unexpected file type: %s' % parsed.path
     return True, None
 
 
@@ -435,8 +441,10 @@ def _tcp_upload(filename, sock):
         offset = 0
         while offset < fw_size:
             if time.monotonic() > deadline:
-                print('Error: firmware upload exceeded the time budget '
-                      '(sent %d of %d bytes)' % (offset, fw_size))
+                print(
+                    'Error: firmware upload exceeded the time budget '
+                    '(sent %d of %d bytes)' % (offset, fw_size)
+                )
                 if offset > 0:
                     return UPLOAD_INCOMPLETE
                 return UPLOAD_FAILED
@@ -448,8 +456,10 @@ def _tcp_upload(filename, sock):
                     return UPLOAD_INCOMPLETE
                 return UPLOAD_FAILED
             if sent == 0:
-                print('Error: connection closed during firmware upload '
-                      '(sent %d of %d bytes)' % (offset, fw_size))
+                print(
+                    'Error: connection closed during firmware upload '
+                    '(sent %d of %d bytes)' % (offset, fw_size)
+                )
                 if offset > 0:
                     return UPLOAD_INCOMPLETE
                 return UPLOAD_FAILED
@@ -459,25 +469,23 @@ def _tcp_upload(filename, sock):
 
 def _verify_firmware_integrity(filepath, content_length=None):
     """Verify downloaded firmware file integrity.
-    
+
     Checks: minimum size (100KB), Content-Length match if provided.
     Returns: (is_valid: bool, error_message: str or None)
     """
     try:
         actual_size = os.path.getsize(filepath)
     except OSError as e:
-        return False, "cannot stat file: %s" % e
-    
+        return False, 'cannot stat file: %s' % e
+
     if actual_size < MIN_FIRMWARE_SIZE:
-        return False, "file too small: %d bytes (minimum %d)" % (
-            actual_size, MIN_FIRMWARE_SIZE)
-    
+        return False, 'file too small: %d bytes (minimum %d)' % (actual_size, MIN_FIRMWARE_SIZE)
+
     if content_length is not None:
         expected_size = int(content_length)
         if actual_size != expected_size:
-            return False, "size mismatch: expected %d bytes, got %d" % (
-                expected_size, actual_size)
-    
+            return False, 'size mismatch: expected %d bytes, got %d' % (expected_size, actual_size)
+
     return True, None
 
 
@@ -506,13 +514,17 @@ def _firmware_backup_path(model_name, version, filename):
     is _backup_root(). Components are sanitized so hostile model/version
     strings cannot escape the directory.
     """
+
     def _sanitize(part):
         cleaned = re.sub(r'[^A-Za-z0-9._-]+', '_', str(part or 'unknown'))
         return cleaned.strip('._') or 'unknown'
 
     return os.path.join(
-        _backup_root(), BACKUP_DIRNAME, _sanitize(model_name),
-        _sanitize(version), os.path.basename(filename),
+        _backup_root(),
+        BACKUP_DIRNAME,
+        _sanitize(model_name),
+        _sanitize(version),
+        os.path.basename(filename),
     )
 
 
@@ -677,15 +689,13 @@ def _retained_message(path):
     return (
         'Firmware image retained at: %s\n'
         'Do NOT power off the printer. Re-run this tool to retry from the '
-        'retained image once power and network are stable.'
-        % os.path.abspath(path)
+        'retained image once power and network are stable.' % os.path.abspath(path)
     )
 
 
 def _incomplete_message(path):
     """Explicit warning for a transfer cut off after partial acceptance."""
-    return ('TRANSFER INCOMPLETE -- DO NOT POWER OFF; reflash from %s'
-            % os.path.abspath(path))
+    return 'TRANSFER INCOMPLETE -- DO NOT POWER OFF; reflash from %s' % os.path.abspath(path)
 
 
 def _interrupt_during_upload(path):
@@ -700,8 +710,7 @@ def _interrupt_during_upload(path):
         'The printer may have received only part of the firmware image, and\n'
         'a printer that loses power mid-flash can be left unusable.\n'
         'Wait a minute or two, then re-run this tool to send a complete\n'
-        'image.\n'
-        + _retained_message(path)
+        'image.\n' + _retained_message(path)
     )
 
 
@@ -711,8 +720,7 @@ def _interrupt_during_verification(path, expected):
         'Upload finished, so the printer is rebooting now. That is safe,\n'
         'but the result was NOT confirmed (expected version %s).\n'
         'Wait a minute or two, then re-run this tool to confirm -- do not\n'
-        'reflash blindly. Image retained at: %s'
-        % (expected, os.path.abspath(path))
+        'reflash blindly. Image retained at: %s' % (expected, os.path.abspath(path))
     )
 
 
@@ -725,8 +733,7 @@ def _stalled_message(path, actual):
         'there is no half-written image to clear.\n'
         'Not every Brother model accepts a firmware image over the raw port\n'
         '(9100); on those the upload completes and is silently discarded.\n'
-        'Use the vendor updater instead. Image retained at: %s'
-        % (actual, os.path.abspath(path))
+        'Use the vendor updater instead. Image retained at: %s' % (actual, os.path.abspath(path))
     )
 
 
@@ -737,9 +744,12 @@ def _query_printer_version(ip, community, cat):
     (still rebooting) or does not report the category.
     """
     try:
-        table = asyncio.run(asyncio.wait_for(
-            _snmp_walk_table(ip, community, BROTHER_SNMP_OID), SNMP_DEADLINE,
-        ))
+        table = asyncio.run(
+            asyncio.wait_for(
+                _snmp_walk_table(ip, community, BROTHER_SNMP_OID),
+                SNMP_DEADLINE,
+            )
+        )
     except Exception:  # noqa: BLE001 -- see below
         # Deliberately broad: any SNMP failure (SnmpError, TimeoutError, or a
         # transport error) means the same thing here — the printer is silent,
@@ -753,8 +763,7 @@ def _query_printer_version(ip, community, cat):
     return None
 
 
-def _verify_flash(ip, community, cat, expected_version,
-                  timeout=None, poll=None, grace=None):
+def _verify_flash(ip, community, cat, expected_version, timeout=None, poll=None, grace=None):
     """Poll the printer until it is back, then compare firmware versions.
 
     A Brother laser reboots after a flash, so readiness is polled within a
@@ -811,9 +820,12 @@ def _printer_ready(ip, community):
     printer, which matters because this runs immediately after a flash.
     """
     try:
-        table = asyncio.run(asyncio.wait_for(
-            _snmp_walk_table(ip, community, BROTHER_SNMP_OID), SNMP_DEADLINE,
-        ))
+        table = asyncio.run(
+            asyncio.wait_for(
+                _snmp_walk_table(ip, community, BROTHER_SNMP_OID),
+                SNMP_DEADLINE,
+            )
+        )
     except Exception:  # noqa: BLE001 -- every SNMP failure means "not ready"
         return False
     return bool(table)
@@ -844,7 +856,7 @@ def _wait_for_printer_ready(ip, community, timeout=None, poll=None):
 
 def _http_post(url, data, hdrs, timeout=HTTP_TIMEOUT):
     """POST data to a URL with comprehensive error handling.
-    
+
     Returns: (response_bytes, None) on success, (None, error_message) on failure.
     Handles: HTTP errors (4xx/5xx), SSL certificate errors, timeouts, DNS failures.
     """
@@ -853,44 +865,44 @@ def _http_post(url, data, hdrs, timeout=HTTP_TIMEOUT):
 
 def _http_request(url, data=None, hdrs=None, timeout=HTTP_TIMEOUT):
     """HTTP request (POST if data provided, GET otherwise) with error handling.
-    
+
     Returns: (response_bytes, None) on success, (None, error_message) on failure.
     """
     try:
-        req = urllib.request.Request(url, data, hdrs) if data else \
-             urllib.request.Request(url, headers=hdrs or {})
+        req = (
+            urllib.request.Request(url, data, hdrs)
+            if data
+            else urllib.request.Request(url, headers=hdrs or {})
+        )
         response = urllib.request.urlopen(req, timeout=timeout)
         return response.read(), None
     except urllib.error.HTTPError as e:
         return None, (
-            "HTTP %d (%s) from Brother server -- "
-            "the firmware service may be temporarily unavailable. "
-            "Try again later." % (e.code, e.reason)
+            'HTTP %d (%s) from Brother server -- '
+            'the firmware service may be temporarily unavailable. '
+            'Try again later.' % (e.code, e.reason)
         )
     except urllib.error.URLError as e:
         reason = e.reason
         if isinstance(reason, ssl.SSLCertVerificationError):
             return None, (
-                "SSL certificate verification failed -- your Python install "
-                "may be missing CA certificates.\n"
+                'SSL certificate verification failed -- your Python install '
+                'may be missing CA certificates.\n'
                 "  Linux: install your distribution's ca-certificates package\n"
-                "  macOS: run Install Certificates.command in your Python installation\n"
-                "  FreeBSD: install ca_root_nss, or set SSL_CERT_FILE to a CA bundle path"
+                '  macOS: run Install Certificates.command in your Python installation\n'
+                '  FreeBSD: install ca_root_nss, or set SSL_CERT_FILE to a CA bundle path'
             )
         if isinstance(reason, socket.timeout):
             return None, (
-                "Connection timed out: check your network and "
-                "try again. The Brother firmware server may be slow."
+                'Connection timed out: check your network and '
+                'try again. The Brother firmware server may be slow.'
             )
-        return None, (
-            "Network error: %s -- check your internet connection "
-            "and try again." % reason
-        )
+        return None, ('Network error: %s -- check your internet connection and try again.' % reason)
 
 
 def _try_version_fallback(version, cat, url, hdrs):
     """Try to get firmware URL by requesting an older version.
-    
+
     Decrements the version number and queries the Brother API.
     Returns firmware URL string on success, None on failure.
     """
@@ -925,443 +937,472 @@ def _printer_port_open(ip, port, timeout):
 
 
 def update_firmware(cat, version):
-  # R7: never interpolate model/spec=None into the vendor XML.
-  forced = (getattr(args, 'category', None) and
-            getattr(args, 'fw_version', None) and
-            args.fw_version != 'B0000000000')
-  if not forced and (not model or not spec):
-    print('REFUSING to query the vendor server: missing model or spec '
-          '(model=%r, spec=%r).' % (model, spec))
-    print('Re-run with --model and valid SNMP data, or force -c/-f explicitly.')
-    return EXIT_REFUSED
+    # R7: never interpolate model/spec=None into the vendor XML.
+    forced = (
+        getattr(args, 'category', None)
+        and getattr(args, 'fw_version', None)
+        and args.fw_version != 'B0000000000'
+    )
+    if not forced and (not model or not spec):
+        print(
+            'REFUSING to query the vendor server: missing model or spec '
+            '(model=%r, spec=%r).' % (model, spec)
+        )
+        print('Re-run with --model and valid SNMP data, or force -c/-f explicitly.')
+        return EXIT_REFUSED
 
-  print('Updating %s version %s' % (cat, version))
+    print('Updating %s version %s' % (cat, version))
 
-  requestInfo = build_firmware_xml(model, spec, cat, version, beta=args.beta)
+    requestInfo = build_firmware_xml(model, spec, cat, version, beta=args.beta)
 
-  if args.verbose: print('request: %s' % requestInfo)
+    if args.verbose:
+        print('request: %s' % requestInfo)
 
-  # Request firmware data
-  url = BROTHER_API_URL
-  hdrs = {'Content-Type': 'text/xml', 'User-Agent': 'BrHttpc/1.00'}
+    # Request firmware data
+    url = BROTHER_API_URL
+    hdrs = {'Content-Type': 'text/xml', 'User-Agent': 'BrHttpc/1.00'}
 
-  print('Looking up printer firmware info at vendor server...')
-  _flush()
+    print('Looking up printer firmware info at vendor server...')
+    _flush()
 
-  response, http_err = _http_post(url, requestInfo, hdrs)
-  if response is None:
-    print('Error: %s' % http_err)
-    return EXIT_VENDOR
-
-  print('done')
-
-  if args.verbose: print('response: %s' % response)
-
-  result = parse_brother_response(response)
-  if result['version_check'] == '1':
-    print('Firmware already up to date')
-    if not getattr(args, 'reflash', False):
-      # R1: already current is terminal unless --reflash was given.
-      return EXIT_CURRENT
-    use_fallback = True
-  elif result['firmware_url'] is None:
-    print('No firmware update info path found '
-          '(newer Brother models require version fallback)')
-    use_fallback = True
-  else:
-    use_fallback = False
-    firmwareURL = result['firmware_url']
-  if use_fallback:
-    firmwareURL = _try_version_fallback(version, cat, url, hdrs)
-    if firmwareURL:
-      print('Found firmware URL via version fallback')
-    else:
-      return EXIT_VENDOR
-
-  # Validate firmware URL before downloading
-  valid, err = _validate_firmware_url(firmwareURL)
-  if not valid:
-    print('Error: firmware URL validation failed: %s' % err)
-    print('URL: %s' % firmwareURL)
-    return EXIT_VENDOR
-
-  # Extract filename from URL (strip query parameters)
-  filename = os.path.basename(urlparse(firmwareURL).path)
-  if not filename:
-    print('Error: could not extract filename from firmware URL')
-    return EXIT_VENDOR
-
-  # R7: refuse a known-older artifact; warn loudly when unparseable.
-  artifact_version = _parse_artifact_version(filename)
-  installed = _version_tuple(version)
-  artifact = _version_tuple(artifact_version)
-  if artifact_version is None or installed is None or artifact is None:
-    print('WARNING: could not verify firmware version from artifact name!')
-    print('         raw artifact filename: %s' % filename)
-    print('         parsed artifact version: %r (installed: %r)'
-          % (artifact_version, version))
-    print('         Proceeding without a downgrade check -- verify manually!')
-  elif artifact < installed:
-    print('REFUSING to flash: artifact version %s is OLDER than the installed '
-          'version %s.' % (artifact_version, version))
-    print('Artifact: %s' % filename)
-    print('This looks like a downgrade; there is no override flag.')
-    return EXIT_REFUSED
-
-  # R2: refuse to flash unattended with no explicit consent, BEFORE the
-  # ~15 MB download. --test is non-destructive and needs no consent.
-  if not args.test and not args.yes and not _isatty(sys.stdin):
-    print('REFUSING to flash firmware unattended.')
-    print('No --yes flag was given and stdin is not a terminal.')
-    print('Re-run with --yes for unattended use, or from an interactive terminal.')
-    return EXIT_REFUSED
-
-  # R16: a read-only reachability probe before the ~15 MB download. This is a
-  # warning, NOT an upload safety gate: a successful connect proves port 9100
-  # is open, not that the printer will accept an image. Refusing here would
-  # only remove the retained-image path for an offline printer. --test must
-  # still fetch a backup, and --password selects FTP, where 9100 is irrelevant.
-  if (not args.test and not args.password
-      and not _printer_port_open(args.ip, 9100, PREFLIGHT_TIMEOUT)):
-    print('WARNING: the printer at %s:9100 did not accept a TCP connect.'
-          % args.ip)
-    print('The upload will likely fail. The download will continue so the '
-          'firmware image is retained for a later retry.')
-    print('An administrator password (FTP) upload path is unaffected.')
-
-  # Resolve the retained-image location and make it usable ONCE, before the
-  # ~15 MB download. Discovering an unwritable backup root after the transfer
-  # would waste the whole download and report it as an opaque failure.
-  backup_path = _firmware_backup_path(model, artifact_version or version, filename)
-  backup_dir = os.path.dirname(backup_path)
-  try:
-    os.makedirs(backup_dir, exist_ok=True)
-  except OSError as e:
-    print('Error: could not create the firmware backup directory: %s' % backup_dir)
-    print(e)
-    return EXIT_DOWNLOAD
-
-  # Report what is already known about any retained copy. The digest records
-  # what was verified at retention time: it proves the retained file is the
-  # bytes that passed, and lets a changed on-disk file or a changed vendor
-  # artifact be detected below. It cannot detect a corrupt download, because
-  # the vendor supplies no expected digest -- only a declared length.
-  retained_state, retained_digest = _retained_copy_state(backup_path)
-  if retained_state == 'verified':
-    print('Retained image matches its recorded digest: %s'
-          % retained_digest[:12])
-  elif retained_state == 'corrupt':
-    print('WARNING: retained image does not match its recorded digest: %s'
-          % retained_digest[:12])
-  elif retained_state == 'unrecorded':
-    print('Retained image has no usable digest record; it cannot be trusted.')
-  else:
-    print('No retained image for this version.')
-
-  # Download firmware
-  print('Downloading firmware file %s from vendor server...' % filename)
-  _flush()
-
-  # A per-invocation partial name inside the backup directory: concurrent runs
-  # cannot collide on it, it is never visible under a real firmware name, and
-  # the promote() below stays a same-filesystem rename.
-  try:
-    fd, part_filename = tempfile.mkstemp(
-        prefix='.' + filename + '.', suffix='.part', dir=backup_dir)
-    os.close(fd)
-    # Release the placeholder immediately: the name is what we needed. Creating
-    # the file here would leave a zero-byte partial behind whenever urlopen
-    # fails (printer offline, CDN 404), and would also hand the retained image
-    # mkstemp's 0600 instead of the umask default. open() below creates it.
-    os.remove(part_filename)
-  except OSError as e:
-    print('Error: could not create a temporary download file in %s: %s'
-          % (backup_dir, e))
-    return EXIT_DOWNLOAD
-
-  # Reuse is only considered when 3A judged the retained copy 'verified' AND
-  # the vendor gave us a validator to condition on. The validator is the
-  # vendor's confirmation that those bytes are still current; a digest alone is
-  # never that confirmation.
-  conditional = {}
-  if retained_state == 'verified':
-    conditional = _conditional_headers(backup_path)
-
-  while True:
-    try:
-      req = urllib.request.Request(firmwareURL, headers=conditional)
-      response = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
-    except urllib.error.HTTPError as e:
-      # urllib raises HTTPError for a 304 rather than returning a response, so a
-      # successful reuse arrives here. Handle it before the generic path below,
-      # which would otherwise report it as a download failure.
-      if e.code == 304 and conditional:
-        reuse_state, reuse_digest = _retained_copy_state(backup_path)
-        if reuse_state == 'verified':
-          _remove_quietly(part_filename)
-          print('Vendor confirmed (HTTP 304) the retained image is current: %s'
-                % os.path.abspath(backup_path))
-          print('No download was performed; reusing the retained image.')
-          filename = backup_path
-          break
-        # The file changed under us between the state check and the 304. Do not
-        # trust it: fall back to a full, unconditional download. Carry the
-        # re-checked classification forward too, so the promote below never
-        # compares the fresh bytes against a stale 'verified' judgement.
-        retained_state, retained_digest = reuse_state, reuse_digest
-        print('Retained image no longer matches its recorded digest; '
-              'downloading it again unconditionally.')
-        conditional = {}
-        continue
-      print('Error: HTTP %d (%s) from Brother CDN -- try again later.' % (e.code, e.reason))
-      return EXIT_DOWNLOAD
-    except urllib.error.URLError as e:
-      print('Error: download failed: %s' % e.reason)
-      return EXIT_DOWNLOAD
-
-    content_length = response.headers.get('Content-Length')
-    declared = None
-    if content_length is not None:
-      try:
-        declared = int(content_length)
-      except (TypeError, ValueError):
-        declared = None
-
-    written = 0
-    try:
-      with open(part_filename, 'wb') as f:
-        while True:
-          block = response.read(DOWNLOAD_CHUNK)
-          if not block: break
-          f.write(block)
-          written += len(block)
-          # R10: bound the loop. Without this a broken or hostile source writes
-          # until the disk fills, and a truncated artifact cannot be told from a
-          # complete one by its name.
-          if written > DOWNLOAD_HARD_CAP:
-            print()
-            print('Error: firmware download exceeded the %d MB safety cap '
-                  '(%d bytes received) -- aborting.'
-                  % (DOWNLOAD_HARD_CAP // (1024 * 1024), written))
-            _remove_quietly(part_filename)
-            return EXIT_DOWNLOAD
-          if declared is not None and written > declared:
-            print()
-            print('Error: firmware download sent more data than its declared '
-                  'Content-Length (%d declared, %d received) -- aborting.'
-                  % (declared, written))
-            _remove_quietly(part_filename)
-            return EXIT_DOWNLOAD
-          if sys.stdout:
-            sys.stdout.write('.')
-            _flush()
-    except (OSError, http.client.HTTPException) as e:
-      print()
-      print('Error: firmware download interrupted: %s' % e)
-      _remove_quietly(part_filename)
-      return EXIT_DOWNLOAD
+    response, http_err = _http_post(url, requestInfo, hdrs)
+    if response is None:
+        print('Error: %s' % http_err)
+        return EXIT_VENDOR
 
     print('done')
 
-    # Verify before promoting the partial file to a real firmware name.
-    valid, err = _verify_firmware_integrity(part_filename, content_length=content_length)
-    if not valid:
-      print('Error: firmware integrity check failed: %s' % err)
-      _remove_quietly(part_filename)
-      return EXIT_DOWNLOAD
+    if args.verbose:
+        print('response: %s' % response)
 
-    # Promote the verified image into its retained recovery location. The file
-    # was downloaded inside that directory, so this is normally a same-filesystem
-    # rename; if it still fails, keep the verified image rather than deleting it.
-    #
-    # Compare the freshly downloaded bytes with what was verified last time first.
-    # Only a 'verified' retained copy can be compared; for anything else the
-    # digest is unknown and the new bytes are promoted unconditionally.
-    #
-    # Reading the partial back can fail (the file was deleted between the
-    # integrity check and here, or the disk failed). That is the same class of
-    # failure as a failed promote, so it reports the same way: EXIT_DOWNLOAD,
-    # and the verified image is named rather than deleted.
-    try:
-      new_digest = _sha256_file(part_filename)
-    except OSError as e:
-      print('Error: could not re-read the downloaded firmware image: %s' % e)
-      print('The verified image is still at: %s' % os.path.abspath(part_filename))
-      return EXIT_DOWNLOAD
-    replace_needed = True
-    if retained_state == 'verified' and new_digest == retained_digest:
-      print('Vendor artifact is unchanged; the retained image is already these '
-            'exact bytes. Nothing rewritten.')
-      _remove_quietly(part_filename)
-      replace_needed = False
-    elif retained_state == 'verified':
-      print('WARNING: the vendor artifact for this version DIFFERS from the '
-            'retained copy.')
-      print('  retained digest: %s' % retained_digest)
-      print('  vendor digest:   %s' % new_digest)
-      print('Brother may have republished this version under the same filename; '
-            'the new bytes replace the retained image.')
-
-    if replace_needed:
-      try:
-        os.replace(part_filename, backup_path)
-      except OSError as e:
-        print('Error: could not store firmware backup: %s' % e)
-        print('The verified image is still at: %s' % os.path.abspath(part_filename))
-        return EXIT_DOWNLOAD
-      # Record the digest now that the bytes are in place. --test retains the
-      # image, so it must leave the same record behind as a flashing run. A record
-      # that cannot be written is not fatal: a missing record means "unknown", and
-      # the next run re-downloads and re-verifies. Never trade the image for it.
-      try:
-        _write_sidecar(backup_path, new_digest)
-      # aislop-ignore-next-line ai-slop/swallowed-exception -- the handler reports the failure; a missing record is fail-open and never costs the verified image.
-      except OSError as e:
-        print('WARNING: could not record the firmware digest at %s: %s'
-              % (_sidecar_path(backup_path), e))
-        print('The image is retained; the next run will re-download and re-verify.')
-
-    # Refresh the vendor validator after every successful body download, even
-    # when the bytes were identical and the 15 MB image was not rewritten: a
-    # stale validator would silently disable the next run's conditional request.
-    try:
-      _write_validator(backup_path, response.headers)
-    # aislop-ignore-next-line ai-slop/swallowed-exception -- the handler reports the failure; a missing validator is fail-open and only costs a future download.
-    except OSError as e:
-      print('WARNING: could not record the vendor validator at %s: %s'
-            % (_validator_path(backup_path), e))
-      print('The image is retained; the next run will download it again to be safe.')
-
-    filename = backup_path
-    break
-
-  if args.test:
-    print('Test mode: no upload attempted.')
-    print('Firmware image retained at: %s' % os.path.abspath(filename))
-    return EXIT_OK
-
-  print('About to upload the firmware to printer.')
-  print('This is a dangerous action since it is potentially destructive.')
-  print('Thus please double-check / review to ensure that:')
-  print('- firmware file version is compatible with your hardware')
-  print('- network connection is reliable (prefer wired connection to WLAN)')
-  print('- power is reliable')
-  if not args.yes:
-    prompt('Press Ctrl-C to prevent upgrade or Enter to continue...')
-
-  # Upload firmware to printer.
-  #
-  # From here until the transfer is acknowledged the printer may be holding a
-  # partial image, so a Ctrl-C in this window is not a harmless abort: it has
-  # to be caught and explained rather than allowed to escape as a traceback.
-  print('Now uploading firmware to printer (DO NOT REMOVE POWER!)...')
-  _flush()
-
-  upload_result = UPLOAD_FAILED
-  try:
-    if args.password is None:
-      # Resolve and connect before the transfer. Failing here means the
-      # printer is unreachable — a different diagnosis, and a different exit
-      # code, from an image the printer refused.
-      try:
-        ai = socket.getaddrinfo(args.ip, 9100, proto=socket.SOL_TCP)[0]
-        sock = socket.socket(ai[0], ai[1], ai[2])
-        try:
-          sock.settimeout(UPLOAD_SOCKET_TIMEOUT)
-          sock.connect(ai[4])
-        except OSError:
-          sock.close()
-          raise
-      except OSError as e:
-        print('Cannot reach the printer at %s:9100 -- %s' % (args.ip, e))
-        print(_retained_message(filename))
-        return EXIT_PRINTER
-
-      # The printer is listening, so past this point a failure is an upload
-      # failure rather than a connectivity problem.
-      try:
-        with sock:
-          upload_result = _tcp_upload(filename, sock)
-      # aislop-ignore-next-line ai-slop/swallowed-exception -- the handler reports the failure; the post-upload version check is authoritative.
-      except OSError as e:
-        print('Firmware update aborted due to error while uploading')
-        print(e)
+    result = parse_brother_response(response)
+    if result['version_check'] == '1':
+        print('Firmware already up to date')
+        if not getattr(args, 'reflash', False):
+            # R1: already current is terminal unless --reflash was given.
+            return EXIT_CURRENT
+        use_fallback = True
+    elif result['firmware_url'] is None:
+        print('No firmware update info path found (newer Brother models require version fallback)')
+        use_fallback = True
     else:
-      try:
-        ftp = FTP(args.ip, user = args.password, timeout = FTP_TIMEOUT) # Yes send password as user
-        try:
-          with open(filename, 'rb') as fw:
-            ftp.storbinary('STOR ' + os.path.basename(filename), fw)
-          # A completed STOR proves the transfer only, not that the printer
-          # accepted the image; the verification step below is authoritative.
-          upload_result = UPLOAD_OK
-        finally:
-          # R9: a failing QUIT must not downgrade a completed STOR — the
-          # transfer has already happened, and the version check decides the
-          # outcome. Reporting a false upload failure here would send the user
-          # chasing a printer that is actually fine.
-          try:
-            ftp.quit()
-          except all_errors:
-            ftp.close()
-      # aislop-ignore-next-line ai-slop/swallowed-exception -- the handler reports the failure; the post-upload version check is authoritative.
-      except all_errors as e:
-        print('Firmware update aborted due to error while uploading')
+        use_fallback = False
+        firmwareURL = result['firmware_url']
+    if use_fallback:
+        firmwareURL = _try_version_fallback(version, cat, url, hdrs)
+        if firmwareURL:
+            print('Found firmware URL via version fallback')
+        else:
+            return EXIT_VENDOR
+
+    # Validate firmware URL before downloading
+    valid, err = _validate_firmware_url(firmwareURL)
+    if not valid:
+        print('Error: firmware URL validation failed: %s' % err)
+        print('URL: %s' % firmwareURL)
+        return EXIT_VENDOR
+
+    # Extract filename from URL (strip query parameters)
+    filename = os.path.basename(urlparse(firmwareURL).path)
+    if not filename:
+        print('Error: could not extract filename from firmware URL')
+        return EXIT_VENDOR
+
+    # R7: refuse a known-older artifact; warn loudly when unparseable.
+    artifact_version = _parse_artifact_version(filename)
+    installed = _version_tuple(version)
+    artifact = _version_tuple(artifact_version)
+    if artifact_version is None or installed is None or artifact is None:
+        print('WARNING: could not verify firmware version from artifact name!')
+        print('         raw artifact filename: %s' % filename)
+        print('         parsed artifact version: %r (installed: %r)' % (artifact_version, version))
+        print('         Proceeding without a downgrade check -- verify manually!')
+    elif artifact < installed:
+        print(
+            'REFUSING to flash: artifact version %s is OLDER than the installed '
+            'version %s.' % (artifact_version, version)
+        )
+        print('Artifact: %s' % filename)
+        print('This looks like a downgrade; there is no override flag.')
+        return EXIT_REFUSED
+
+    # R2: refuse to flash unattended with no explicit consent, BEFORE the
+    # ~15 MB download. --test is non-destructive and needs no consent.
+    if not args.test and not args.yes and not _isatty(sys.stdin):
+        print('REFUSING to flash firmware unattended.')
+        print('No --yes flag was given and stdin is not a terminal.')
+        print('Re-run with --yes for unattended use, or from an interactive terminal.')
+        return EXIT_REFUSED
+
+    # R16: a read-only reachability probe before the ~15 MB download. This is a
+    # warning, NOT an upload safety gate: a successful connect proves port 9100
+    # is open, not that the printer will accept an image. Refusing here would
+    # only remove the retained-image path for an offline printer. --test must
+    # still fetch a backup, and --password selects FTP, where 9100 is irrelevant.
+    if (
+        not args.test
+        and not args.password
+        and not _printer_port_open(args.ip, 9100, PREFLIGHT_TIMEOUT)
+    ):
+        print('WARNING: the printer at %s:9100 did not accept a TCP connect.' % args.ip)
+        print(
+            'The upload will likely fail. The download will continue so the '
+            'firmware image is retained for a later retry.'
+        )
+        print('An administrator password (FTP) upload path is unaffected.')
+
+    # Resolve the retained-image location and make it usable ONCE, before the
+    # ~15 MB download. Discovering an unwritable backup root after the transfer
+    # would waste the whole download and report it as an opaque failure.
+    backup_path = _firmware_backup_path(model, artifact_version or version, filename)
+    backup_dir = os.path.dirname(backup_path)
+    try:
+        os.makedirs(backup_dir, exist_ok=True)
+    except OSError as e:
+        print('Error: could not create the firmware backup directory: %s' % backup_dir)
         print(e)
-  except KeyboardInterrupt:
+        return EXIT_DOWNLOAD
+
+    # Report what is already known about any retained copy. The digest records
+    # what was verified at retention time: it proves the retained file is the
+    # bytes that passed, and lets a changed on-disk file or a changed vendor
+    # artifact be detected below. It cannot detect a corrupt download, because
+    # the vendor supplies no expected digest -- only a declared length.
+    retained_state, retained_digest = _retained_copy_state(backup_path)
+    if retained_state == 'verified':
+        print('Retained image matches its recorded digest: %s' % retained_digest[:12])
+    elif retained_state == 'corrupt':
+        print(
+            'WARNING: retained image does not match its recorded digest: %s' % retained_digest[:12]
+        )
+    elif retained_state == 'unrecorded':
+        print('Retained image has no usable digest record; it cannot be trusted.')
+    else:
+        print('No retained image for this version.')
+
+    # Download firmware
+    print('Downloading firmware file %s from vendor server...' % filename)
+    _flush()
+
+    # A per-invocation partial name inside the backup directory: concurrent runs
+    # cannot collide on it, it is never visible under a real firmware name, and
+    # the promote() below stays a same-filesystem rename.
+    try:
+        fd, part_filename = tempfile.mkstemp(
+            prefix='.' + filename + '.', suffix='.part', dir=backup_dir
+        )
+        os.close(fd)
+        # Release the placeholder immediately: the name is what we needed. Creating
+        # the file here would leave a zero-byte partial behind whenever urlopen
+        # fails (printer offline, CDN 404), and would also hand the retained image
+        # mkstemp's 0600 instead of the umask default. open() below creates it.
+        os.remove(part_filename)
+    except OSError as e:
+        print('Error: could not create a temporary download file in %s: %s' % (backup_dir, e))
+        return EXIT_DOWNLOAD
+
+    # Reuse is only considered when 3A judged the retained copy 'verified' AND
+    # the vendor gave us a validator to condition on. The validator is the
+    # vendor's confirmation that those bytes are still current; a digest alone is
+    # never that confirmation.
+    conditional = {}
+    if retained_state == 'verified':
+        conditional = _conditional_headers(backup_path)
+
+    while True:
+        try:
+            req = urllib.request.Request(firmwareURL, headers=conditional)
+            response = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            # urllib raises HTTPError for a 304 rather than returning a response, so a
+            # successful reuse arrives here. Handle it before the generic path below,
+            # which would otherwise report it as a download failure.
+            if e.code == 304 and conditional:
+                reuse_state, reuse_digest = _retained_copy_state(backup_path)
+                if reuse_state == 'verified':
+                    _remove_quietly(part_filename)
+                    print(
+                        'Vendor confirmed (HTTP 304) the retained image is current: %s'
+                        % os.path.abspath(backup_path)
+                    )
+                    print('No download was performed; reusing the retained image.')
+                    filename = backup_path
+                    break
+                # The file changed under us between the state check and the 304. Do not
+                # trust it: fall back to a full, unconditional download. Carry the
+                # re-checked classification forward too, so the promote below never
+                # compares the fresh bytes against a stale 'verified' judgement.
+                retained_state, retained_digest = reuse_state, reuse_digest
+                print(
+                    'Retained image no longer matches its recorded digest; '
+                    'downloading it again unconditionally.'
+                )
+                conditional = {}
+                continue
+            print('Error: HTTP %d (%s) from Brother CDN -- try again later.' % (e.code, e.reason))
+            return EXIT_DOWNLOAD
+        except urllib.error.URLError as e:
+            print('Error: download failed: %s' % e.reason)
+            return EXIT_DOWNLOAD
+
+        content_length = response.headers.get('Content-Length')
+        declared = None
+        if content_length is not None:
+            try:
+                declared = int(content_length)
+            except (TypeError, ValueError):
+                declared = None
+
+        written = 0
+        try:
+            with open(part_filename, 'wb') as f:
+                while True:
+                    block = response.read(DOWNLOAD_CHUNK)
+                    if not block:
+                        break
+                    f.write(block)
+                    written += len(block)
+                    # R10: bound the loop. Without this a broken or hostile source writes
+                    # until the disk fills, and a truncated artifact cannot be told from a
+                    # complete one by its name.
+                    if written > DOWNLOAD_HARD_CAP:
+                        print()
+                        print(
+                            'Error: firmware download exceeded the %d MB safety cap '
+                            '(%d bytes received) -- aborting.'
+                            % (DOWNLOAD_HARD_CAP // (1024 * 1024), written)
+                        )
+                        _remove_quietly(part_filename)
+                        return EXIT_DOWNLOAD
+                    if declared is not None and written > declared:
+                        print()
+                        print(
+                            'Error: firmware download sent more data than its declared '
+                            'Content-Length (%d declared, %d received) -- aborting.'
+                            % (declared, written)
+                        )
+                        _remove_quietly(part_filename)
+                        return EXIT_DOWNLOAD
+                    if sys.stdout:
+                        sys.stdout.write('.')
+                        _flush()
+        except (OSError, http.client.HTTPException) as e:
+            print()
+            print('Error: firmware download interrupted: %s' % e)
+            _remove_quietly(part_filename)
+            return EXIT_DOWNLOAD
+
+        print('done')
+
+        # Verify before promoting the partial file to a real firmware name.
+        valid, err = _verify_firmware_integrity(part_filename, content_length=content_length)
+        if not valid:
+            print('Error: firmware integrity check failed: %s' % err)
+            _remove_quietly(part_filename)
+            return EXIT_DOWNLOAD
+
+        # Promote the verified image into its retained recovery location. The file
+        # was downloaded inside that directory, so this is normally a same-filesystem
+        # rename; if it still fails, keep the verified image rather than deleting it.
+        #
+        # Compare the freshly downloaded bytes with what was verified last time first.
+        # Only a 'verified' retained copy can be compared; for anything else the
+        # digest is unknown and the new bytes are promoted unconditionally.
+        #
+        # Reading the partial back can fail (the file was deleted between the
+        # integrity check and here, or the disk failed). That is the same class of
+        # failure as a failed promote, so it reports the same way: EXIT_DOWNLOAD,
+        # and the verified image is named rather than deleted.
+        try:
+            new_digest = _sha256_file(part_filename)
+        except OSError as e:
+            print('Error: could not re-read the downloaded firmware image: %s' % e)
+            print('The verified image is still at: %s' % os.path.abspath(part_filename))
+            return EXIT_DOWNLOAD
+        replace_needed = True
+        if retained_state == 'verified' and new_digest == retained_digest:
+            print(
+                'Vendor artifact is unchanged; the retained image is already these '
+                'exact bytes. Nothing rewritten.'
+            )
+            _remove_quietly(part_filename)
+            replace_needed = False
+        elif retained_state == 'verified':
+            print('WARNING: the vendor artifact for this version DIFFERS from the retained copy.')
+            print('  retained digest: %s' % retained_digest)
+            print('  vendor digest:   %s' % new_digest)
+            print(
+                'Brother may have republished this version under the same filename; '
+                'the new bytes replace the retained image.'
+            )
+
+        if replace_needed:
+            try:
+                os.replace(part_filename, backup_path)
+            except OSError as e:
+                print('Error: could not store firmware backup: %s' % e)
+                print('The verified image is still at: %s' % os.path.abspath(part_filename))
+                return EXIT_DOWNLOAD
+            # Record the digest now that the bytes are in place. --test retains the
+            # image, so it must leave the same record behind as a flashing run. A record
+            # that cannot be written is not fatal: a missing record means "unknown", and
+            # the next run re-downloads and re-verifies. Never trade the image for it.
+            try:
+                _write_sidecar(backup_path, new_digest)
+            # aislop-ignore-next-line ai-slop/swallowed-exception -- the handler reports the failure; a missing record is fail-open and never costs the verified image.
+            except OSError as e:
+                print(
+                    'WARNING: could not record the firmware digest at %s: %s'
+                    % (_sidecar_path(backup_path), e)
+                )
+                print('The image is retained; the next run will re-download and re-verify.')
+
+        # Refresh the vendor validator after every successful body download, even
+        # when the bytes were identical and the 15 MB image was not rewritten: a
+        # stale validator would silently disable the next run's conditional request.
+        try:
+            _write_validator(backup_path, response.headers)
+        # aislop-ignore-next-line ai-slop/swallowed-exception -- the handler reports the failure; a missing validator is fail-open and only costs a future download.
+        except OSError as e:
+            print(
+                'WARNING: could not record the vendor validator at %s: %s'
+                % (_validator_path(backup_path), e)
+            )
+            print('The image is retained; the next run will download it again to be safe.')
+
+        filename = backup_path
+        break
+
+    if args.test:
+        print('Test mode: no upload attempted.')
+        print('Firmware image retained at: %s' % os.path.abspath(filename))
+        return EXIT_OK
+
+    print('About to upload the firmware to printer.')
+    print('This is a dangerous action since it is potentially destructive.')
+    print('Thus please double-check / review to ensure that:')
+    print('- firmware file version is compatible with your hardware')
+    print('- network connection is reliable (prefer wired connection to WLAN)')
+    print('- power is reliable')
+    if not args.yes:
+        prompt('Press Ctrl-C to prevent upgrade or Enter to continue...')
+
+    # Upload firmware to printer.
+    #
+    # From here until the transfer is acknowledged the printer may be holding a
+    # partial image, so a Ctrl-C in this window is not a harmless abort: it has
+    # to be caught and explained rather than allowed to escape as a traceback.
+    print('Now uploading firmware to printer (DO NOT REMOVE POWER!)...')
+    _flush()
+
+    upload_result = UPLOAD_FAILED
+    try:
+        if args.password is None:
+            # Resolve and connect before the transfer. Failing here means the
+            # printer is unreachable — a different diagnosis, and a different exit
+            # code, from an image the printer refused.
+            try:
+                ai = socket.getaddrinfo(args.ip, 9100, proto=socket.SOL_TCP)[0]
+                sock = socket.socket(ai[0], ai[1], ai[2])
+                try:
+                    sock.settimeout(UPLOAD_SOCKET_TIMEOUT)
+                    sock.connect(ai[4])
+                except OSError:
+                    sock.close()
+                    raise
+            except OSError as e:
+                print('Cannot reach the printer at %s:9100 -- %s' % (args.ip, e))
+                print(_retained_message(filename))
+                return EXIT_PRINTER
+
+            # The printer is listening, so past this point a failure is an upload
+            # failure rather than a connectivity problem.
+            try:
+                with sock:
+                    upload_result = _tcp_upload(filename, sock)
+            # aislop-ignore-next-line ai-slop/swallowed-exception -- the handler reports the failure; the post-upload version check is authoritative.
+            except OSError as e:
+                print('Firmware update aborted due to error while uploading')
+                print(e)
+        else:
+            try:
+                ftp = FTP(
+                    args.ip, user=args.password, timeout=FTP_TIMEOUT
+                )  # Yes send password as user
+                try:
+                    with open(filename, 'rb') as fw:
+                        ftp.storbinary('STOR ' + os.path.basename(filename), fw)
+                    # A completed STOR proves the transfer only, not that the printer
+                    # accepted the image; the verification step below is authoritative.
+                    upload_result = UPLOAD_OK
+                finally:
+                    # R9: a failing QUIT must not downgrade a completed STOR — the
+                    # transfer has already happened, and the version check decides the
+                    # outcome. Reporting a false upload failure here would send the user
+                    # chasing a printer that is actually fine.
+                    try:
+                        ftp.quit()
+                    except all_errors:
+                        ftp.close()
+            # aislop-ignore-next-line ai-slop/swallowed-exception -- the handler reports the failure; the post-upload version check is authoritative.
+            except all_errors as e:
+                print('Firmware update aborted due to error while uploading')
+                print(e)
+    except KeyboardInterrupt:
+        print()
+        print(_interrupt_during_upload(filename))
+        return EXIT_UPLOAD
+
+    if upload_result == UPLOAD_INCOMPLETE:
+        print(_incomplete_message(filename))
+        return EXIT_UPLOAD
+
+    if upload_result is not True:
+        print('Firmware upload failed: the printer did not accept the image.')
+        print(_retained_message(filename))
+        return EXIT_UPLOAD
+
+    print('done')
     print()
-    print(_interrupt_during_upload(filename))
-    return EXIT_UPLOAD
+    print('Wait for printer to finish updating and reboot before continuing.')
 
-  if upload_result == UPLOAD_INCOMPLETE:
-    print(_incomplete_message(filename))
-    return EXIT_UPLOAD
+    # TCP 9100 is fire-and-forget: confirm the printer came back on the
+    # expected version instead of trusting "the socket did not raise".
+    #
+    # Interrupting here is safe — the image is already on the printer and it is
+    # rebooting — but the outcome is unconfirmed, so report that honestly
+    # rather than claiming a success that was never checked.
+    try:
+        status, actual = _verify_flash(
+            args.ip, getattr(args, 'community', 'public'), cat, artifact_version
+        )
+    except KeyboardInterrupt:
+        print()
+        print(_interrupt_during_verification(filename, artifact_version))
+        return EXIT_UNVERIFIED
 
-  if upload_result is not True:
-    print('Firmware upload failed: the printer did not accept the image.')
-    print(_retained_message(filename))
-    return EXIT_UPLOAD
+    if status == 'unverified':
+        print(
+            'Uploaded, but the version could not be verified because the '
+            'printer did not come back in time.'
+        )
+        print('expected=%s actual=%s' % (artifact_version, actual))
+        print(_retained_message(filename))
+        return EXIT_UNVERIFIED
 
-  print('done')
-  print()
-  print('Wait for printer to finish updating and reboot before continuing.')
+    if status == 'stalled':
+        print('Firmware update did NOT start: the printer kept answering on version %s.' % actual)
+        print(_stalled_message(filename, actual))
+        return EXIT_UPLOAD
 
-  # TCP 9100 is fire-and-forget: confirm the printer came back on the
-  # expected version instead of trusting "the socket did not raise".
-  #
-  # Interrupting here is safe — the image is already on the printer and it is
-  # rebooting — but the outcome is unconfirmed, so report that honestly
-  # rather than claiming a success that was never checked.
-  try:
-    status, actual = _verify_flash(
-        args.ip, getattr(args, 'community', 'public'), cat, artifact_version)
-  except KeyboardInterrupt:
-    print()
-    print(_interrupt_during_verification(filename, artifact_version))
-    return EXIT_UNVERIFIED
+    if status == 'mismatch':
+        print('Firmware verification FAILED: expected=%s actual=%s' % (artifact_version, actual))
+        print(_retained_message(filename))
+        return EXIT_UPLOAD
 
-  if status == 'unverified':
-    print('Uploaded, but the version could not be verified because the '
-          'printer did not come back in time.')
-    print('expected=%s actual=%s' % (artifact_version, actual))
-    print(_retained_message(filename))
-    return EXIT_UNVERIFIED
-
-  if status == 'stalled':
-    print('Firmware update did NOT start: the printer kept answering on '
-          'version %s.' % actual)
-    print(_stalled_message(filename, actual))
-    return EXIT_UPLOAD
-
-  if status == 'mismatch':
-    print('Firmware verification FAILED: expected=%s actual=%s'
-          % (artifact_version, actual))
-    print(_retained_message(filename))
-    return EXIT_UPLOAD
-
-  print('Firmware verified: expected=%s actual=%s' % (artifact_version, actual))
-  _remove_quietly(filename)
-  return EXIT_OK
+    print('Firmware verified: expected=%s actual=%s' % (artifact_version, actual))
+    _remove_quietly(filename)
+    return EXIT_OK
 
 
 class SnmpError(Exception):
@@ -1379,12 +1420,14 @@ class SnmpError(Exception):
 
 async def _snmp_walk_table(ip, community, oid):
     """Walk an SNMP OID on a Brother printer using pysnmp 7.x async API.
-    
+
     Returns: list of rows, each row is list of (oid_str, value_str) tuples.
     Raises SnmpError on SNMP errors.
     """
     transport = await UdpTransportTarget.create(
-        (ip, 161), timeout=SNMP_TIMEOUT, retries=SNMP_RETRIES,
+        (ip, 161),
+        timeout=SNMP_TIMEOUT,
+        retries=SNMP_RETRIES,
     )
     table = []
     async for errorIndication, errorStatus, errorIndex, varBinds in walk_cmd(
@@ -1397,15 +1440,15 @@ async def _snmp_walk_table(ip, community, oid):
         if errorIndication:
             raise SnmpError(
                 'No SNMP response from %s (%s). The printer may be off, on a '
-                'different address, or have SNMP disabled.'
-                % (ip, errorIndication),
-                EXIT_PRINTER)
+                'different address, or have SNMP disabled.' % (ip, errorIndication),
+                EXIT_PRINTER,
+            )
         if errorStatus:
             raise SnmpError(
-                'SNMP error reading the printer: %s at %s' % (
-                    errorStatus.prettyPrint(),
-                    errorIndex and varBinds[int(errorIndex) - 1] or '?'),
-                EXIT_ERROR)
+                'SNMP error reading the printer: %s at %s'
+                % (errorStatus.prettyPrint(), errorIndex and varBinds[int(errorIndex) - 1] or '?'),
+                EXIT_ERROR,
+            )
         row = []
         for varBind in varBinds:
             oid_str = str(varBind[0])
@@ -1432,20 +1475,20 @@ def main() -> int:
         # nothing to apply the version to, and the flag used to be silently
         # ignored — the user believed they had forced a version and had not.
         if args.fw_version != FW_VERSION_SENTINEL and not args.category:
-            parser.error('-f/--fw-version requires -c/--category '
-                         '(there is no category to apply it to)')
+            parser.error(
+                '-f/--fw-version requires -c/--category (there is no category to apply it to)'
+            )
 
         # R13: --beta pulls pre-release firmware from the vendor, so it needs
         # explicit consent rather than being its own opt-in. --test cannot
         # write to the printer, so it stays usable for inspecting a beta image.
         if args.beta and not args.yes and not args.test:
             print('REFUSING: --beta downloads pre-release firmware.')
-            print('Pass --yes to confirm, or --test to fetch it without '
-                  'flashing.')
+            print('Pass --yes to confirm, or --test to fetch it without flashing.')
             return EXIT_REFUSED
 
         # Provide information about requirements
-        print('You may need to check the following in the printer\'s configuration:')
+        print("You may need to check the following in the printer's configuration:")
         print('  - SNMP service is enabled (for fetching model and versions)')
         if args.password:
             print('  - FTP service is enabled (for uploading firmware)')
@@ -1458,10 +1501,12 @@ def main() -> int:
         _flush()
 
         try:
-            table = asyncio.run(asyncio.wait_for(
-                _snmp_walk_table(args.ip, args.community, BROTHER_SNMP_OID),
-                SNMP_DEADLINE,
-            ))
+            table = asyncio.run(
+                asyncio.wait_for(
+                    _snmp_walk_table(args.ip, args.community, BROTHER_SNMP_OID),
+                    SNMP_DEADLINE,
+                )
+            )
         except SnmpError as e:
             # An off or unreachable printer is the single most common way
             # this tool fails, so it gets its own exit code rather than
@@ -1471,13 +1516,14 @@ def main() -> int:
         except (TimeoutError, asyncio.TimeoutError):
             # asyncio.TimeoutError is an alias of TimeoutError on 3.11+;
             # listing both keeps this correct on 3.10 as well.
-            print('No SNMP response from %s within %ds. The printer may be '
-                  'off, on a different address, or have SNMP disabled.'
-                  % (args.ip, SNMP_DEADLINE), file=sys.stderr)
+            print(
+                'No SNMP response from %s within %ds. The printer may be '
+                'off, on a different address, or have SNMP disabled.' % (args.ip, SNMP_DEADLINE),
+                file=sys.stderr,
+            )
             return EXIT_PRINTER
         except OSError as e:
-            print('Cannot reach the printer at %s:161 -- %s' % (args.ip, e),
-                  file=sys.stderr)
+            print('Cannot reach the printer at %s:161 -- %s' % (args.ip, e), file=sys.stderr)
             return EXIT_PRINTER
 
         print('done')
@@ -1490,7 +1536,8 @@ def main() -> int:
         firmInfo = info['firmwares']
 
         # Override model
-        if args.model: model = args.model
+        if args.model:
+            model = args.model
 
         # Override category and version
         if args.category:
@@ -1503,15 +1550,16 @@ def main() -> int:
                     installed_for_cat = entry['version']
                     break
             if args.fw_version != FW_VERSION_SENTINEL:
-                forced_version = args.fw_version   # the user asserted it
+                forced_version = args.fw_version  # the user asserted it
             elif installed_for_cat is not None:
                 forced_version = installed_for_cat
             else:
-                print('REFUSING: -c %s was given but the printer does not '
-                      'report that category, so a downgrade cannot be ruled '
-                      'out.' % args.category)
-                print('Pass -f <version> to state the installed version '
-                      'explicitly.')
+                print(
+                    'REFUSING: -c %s was given but the printer does not '
+                    'report that category, so a downgrade cannot be ruled '
+                    'out.' % args.category
+                )
+                print('Pass -f <version> to state the installed version explicitly.')
                 return EXIT_REFUSED
             firmInfo = [{'cat': args.category, 'version': forced_version}]
 
@@ -1523,17 +1571,21 @@ def main() -> int:
         print('   firmwares')
 
         for entry in firmInfo:
-          print('    category = %(cat)s, version = %(version)s' % entry)
+            print('    category = %(cat)s, version = %(version)s' % entry)
 
         print()
 
         codes = []
         num_firmwares = len(firmInfo)
         if num_firmwares > 1:
-            print('WARNING: %d firmware updates pending. '
-                  'Printer may reboot between updates.' % num_firmwares)
-            print('The printer will be polled until it answers again between '
-                  'updates (up to %d seconds).' % READY_TIMEOUT)
+            print(
+                'WARNING: %d firmware updates pending. '
+                'Printer may reboot between updates.' % num_firmwares
+            )
+            print(
+                'The printer will be polled until it answers again between '
+                'updates (up to %d seconds).' % READY_TIMEOUT
+            )
             if not args.yes:
                 prompt('Press Ctrl-C to abort or Enter to continue...')
 
@@ -1545,16 +1597,15 @@ def main() -> int:
                 # R11: the next category needs a printer that has finished
                 # rebooting, so wait for it to answer rather than guessing
                 # with a fixed sleep.
-                print('Waiting for the printer to come back before the next '
-                      'update...')
+                print('Waiting for the printer to come back before the next update...')
                 _flush()
-                waited = _wait_for_printer_ready(
-                    args.ip, getattr(args, 'community', 'public'))
+                waited = _wait_for_printer_ready(args.ip, getattr(args, 'community', 'public'))
                 if waited is None:
-                    print('The printer did not answer within %d seconds.'
-                          % READY_TIMEOUT)
-                    print('Skipping the remaining %d update(s) -- re-run once '
-                          'it is back.' % (num_firmwares - i - 1))
+                    print('The printer did not answer within %d seconds.' % READY_TIMEOUT)
+                    print(
+                        'Skipping the remaining %d update(s) -- re-run once '
+                        'it is back.' % (num_firmwares - i - 1)
+                    )
                     codes.append(EXIT_PRINTER)
                     break
                 print('Printer is back (%.0fs).' % waited)
@@ -1572,19 +1623,19 @@ def main() -> int:
         print()
         if final == EXIT_OK:
             if args.test:
-                print('Firmware image fetched and verified (test mode: '
-                      'nothing was uploaded)')
+                print('Firmware image fetched and verified (test mode: nothing was uploaded)')
             else:
                 print('Firmware update completed')
         elif final == EXIT_CURRENT:
             print('No firmware update was needed')
         elif final == EXIT_UNVERIFIED:
-            print('Firmware was uploaded, but the version could not be '
-                  'verified (the printer did not come back in time). '
-                  'Do not reflash blindly.')
+            print(
+                'Firmware was uploaded, but the version could not be '
+                'verified (the printer did not come back in time). '
+                'Do not reflash blindly.'
+            )
         else:
-            print('FAILURE: firmware update did not complete (exit code %d)'
-                  % final)
+            print('FAILURE: firmware update did not complete (exit code %d)' % final)
         return final
 
     except KeyboardInterrupt:
