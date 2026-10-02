@@ -33,3 +33,22 @@ jobs:
 
       - name: Pin the pysnmp 7.x v1arch API surface
         run: python -c "from pysnmp.hlapi.v1arch import walk_cmd"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install lint tooling
+        run: python -m pip install -e '.[dev]'
+
+      # The lint gate is pinned in pyproject.toml ([tool.ruff]); house-style
+      # rules (UP031 %-formatting, FURB167 re.M, EXE001) are deliberate
+      # suppressions, not oversights. See .aislop/config.yml.
+      - name: Lint (ruff)
+        run: ruff check .

@@ -56,3 +56,6 @@ firmware_backups/
 
 # aislop local scan history (tool state, not project state)
 .aislop/history.jsonl
+
+# local dev virtualenv
+.venv/

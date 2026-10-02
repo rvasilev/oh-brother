@@ -16,6 +16,7 @@ dependencies = ["pysnmp>=7.1.0,<8"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+dev = ["pytest>=8", "ruff>=0.16,<0.17"]
 
 [project.urls]
 Homepage = "https://github.com/rvasilev/oh-brother"
@@ -26,3 +27,29 @@ oh-brother = "oh_brother:main"
 
 [tool.setuptools]
 py-modules = ["oh_brother"]
+
+[tool.ruff]
+# Pin the lint gate so it does not drift with a future ruff default change.
+target-version = "py310"
+line-length = 100
+extend-exclude = ["firmware_backups", "build"]
+
+[tool.ruff.lint]
+# ruff's default rule set, minus the project's deliberate house style. Each
+# suppression is a decision, not an oversight — see .aislop/config.yml.
+ignore = [
+    # %-formatting throughout, matching upstream. 72 of 80 source findings were
+    # this one rule; aislop also disables it (ruff/UP031: "off").
+    "UP031",
+    # re.M is a readability preference, yet ruff/aislop classify it as an error.
+    "FURB167",
+    # scripts/check_agents_md.py is invoked as `python3 scripts/...`, not directly.
+    "EXE001",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Python hides DeprecationWarning outside __main__ (and conftest replaces pysnmp
+# with a MagicMock, so a pysnmp deprecation would otherwise never surface).
+# Fail the suite on it: that is where a future pysnmp 8.x rename should show up.
+filterwarnings = ["error::DeprecationWarning"]
