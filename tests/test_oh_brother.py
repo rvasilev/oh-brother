@@ -5,6 +5,7 @@ import os
 import sys
 import urllib.error
 import xml.etree.ElementTree as ET
+
 import pytest
 
 # Import oh_brother.py by path
@@ -262,7 +263,7 @@ class TestCLI:
 
     def test_category_with_version(self):
         args = oh.parser.parse_args(
-            "--category SUB1 --fw-version 2.00 1.2.3.4".split())
+            ["--category", "SUB1", "--fw-version", "2.00", "1.2.3.4"])
         assert args.category == "SUB1"
         assert args.fw_version == "2.00"
 
@@ -316,7 +317,6 @@ class TestMainSmoke:
 
     def test_main_parses_snmp_and_calls_update(self, monkeypatch):
         """main() extracts SNMP data then calls update_firmware for each category."""
-        from unittest.mock import MagicMock
 
         async def fake_walk_cmd(*args, **kwargs):
             table = []
@@ -341,7 +341,6 @@ class TestMainSmoke:
 
     def test_main_model_override(self, monkeypatch):
         """--model flag overrides SNMP-discovered model."""
-        from unittest.mock import MagicMock
 
         async def fake_walk_cmd(*args, **kwargs):
             table = []
@@ -368,7 +367,6 @@ class TestMainSmoke:
 
     def test_main_category_override(self, monkeypatch):
         """--category + --version replace all firmware entries."""
-        from unittest.mock import MagicMock
 
         async def fake_walk_cmd(*args, **kwargs):
             table = []
@@ -395,7 +393,6 @@ class TestMainSmoke:
 
     def test_main_snmp_error_raises(self, monkeypatch):
         """SNMP error raises Exception."""
-        from unittest.mock import MagicMock
 
         async def fake_walk_cmd(*args, **kwargs):
             print("SNMP timeout", file=sys.stderr)
@@ -433,7 +430,6 @@ class TestMainSmoke:
         that is still rebooting, wasted time when it is already back — so pin
         both the poll and the absence of the sleep.
         """
-        from unittest.mock import MagicMock
 
         # SNMP data with MAIN + SUB1 firmware
         multi_fw_table = [
@@ -526,8 +522,8 @@ class TestUpdateFirmware:
 
     def test_version_up_to_date(self, monkeypatch):
         """VERSIONCHECK=1 without --reflash → EXIT_CURRENT, no fallback."""
-        from unittest.mock import MagicMock
         from types import SimpleNamespace
+        from unittest.mock import MagicMock
 
         oh.args = SimpleNamespace(
             beta=False, verbose=False, test=False, yes=False,
@@ -547,8 +543,8 @@ class TestUpdateFirmware:
 
     def test_no_path_returns_none(self, monkeypatch):
         """No PATH element and fallback fails → EXIT_VENDOR."""
-        from unittest.mock import MagicMock
         from types import SimpleNamespace
+        from unittest.mock import MagicMock
 
         oh.args = SimpleNamespace(
             beta=False, verbose=False, test=False, yes=False,
@@ -577,8 +573,8 @@ class TestUpdateFirmware:
 
     def test_test_flag_stops_before_upload(self, monkeypatch, tmp_path):
         """--test downloads firmware but does not upload; image is retained."""
-        from unittest.mock import MagicMock
         from types import SimpleNamespace
+        from unittest.mock import MagicMock
 
         oh.args = SimpleNamespace(
             beta=False, verbose=False, test=True, yes=False,
@@ -626,8 +622,8 @@ class TestUpdateFirmware:
 
     def test_yes_skips_prompts(self, monkeypatch):
         """--yes flag skips all input() prompts."""
-        from unittest.mock import MagicMock
         from types import SimpleNamespace
+        from unittest.mock import MagicMock
 
         oh.args = SimpleNamespace(
             beta=False, verbose=False, test=False, yes=True,
@@ -648,8 +644,8 @@ class TestUpdateFirmware:
 
     def test_vcheck1_fallback_succeeds(self, monkeypatch, tmp_path):
         """VCHECK=1 WITH --reflash → retries with decremented version, gets PATH."""
-        from unittest.mock import MagicMock
         from types import SimpleNamespace
+        from unittest.mock import MagicMock
 
         oh.args = SimpleNamespace(
             beta=False, verbose=False, test=True, yes=True,
@@ -695,8 +691,8 @@ class TestUpdateFirmware:
 
     def test_vcheck1_fallback_fails(self, monkeypatch):
         """VCHECK=1 with --reflash, fallback also VCHECK=1 → EXIT_VENDOR."""
-        from unittest.mock import MagicMock
         from types import SimpleNamespace
+        from unittest.mock import MagicMock
 
         oh.args = SimpleNamespace(
             beta=False, verbose=False, test=False, yes=True,
@@ -782,7 +778,7 @@ class TestValidateFirmwareUrl:
 
     def test_valid_upd_extension(self):
         """.upd files are valid Brother firmware."""
-        valid, err = oh._validate_firmware_url(
+        valid, _err = oh._validate_firmware_url(
             "http://download.brother.com/pub/HL1110_SUB1.upd"
         )
         assert valid is True
@@ -813,12 +809,12 @@ class TestValidateFirmwareUrl:
 
     def test_empty_url(self):
         """Empty URL — should fail."""
-        valid, err = oh._validate_firmware_url("")
+        valid, _err = oh._validate_firmware_url("")
         assert valid is False
 
     def test_url_with_query_params(self):
         """URL with query params — should still validate (extension before ?)."""
-        valid, err = oh._validate_firmware_url(
+        valid, _err = oh._validate_firmware_url(
             "http://update-akamai.brother.co.jp/CS/D00XXX_A.djf?token=abc"
         )
         assert valid is True
@@ -920,7 +916,7 @@ class TestVerifyFirmwareIntegrity:
         fw_path = tmp_path / "test.djf"
         fw_path.write_bytes(b"\x00" * 102400)  # 100KB
 
-        valid, err = oh._verify_firmware_integrity(str(fw_path))
+        valid, _err = oh._verify_firmware_integrity(str(fw_path))
         assert valid is True
 
     def test_size_gate_only(self, tmp_path):
@@ -928,7 +924,7 @@ class TestVerifyFirmwareIntegrity:
         fw_path = tmp_path / "test.djf"
         fw_path.write_bytes(b"\x00" * 500000)  # 500KB
 
-        valid, err = oh._verify_firmware_integrity(str(fw_path))
+        valid, _err = oh._verify_firmware_integrity(str(fw_path))
         assert valid is True
 
 
@@ -958,7 +954,6 @@ class TestHttpPost:
 
     def test_http_503(self, monkeypatch):
         """HTTP 503 returns None + error message."""
-        from unittest.mock import MagicMock
         import urllib.error
 
         def fake_urlopen(req, timeout=None, context=None):
@@ -976,9 +971,8 @@ class TestHttpPost:
 
     def test_ssl_cert_error(self, monkeypatch):
         """SSL certificate error returns None + cert guidance."""
-        from unittest.mock import MagicMock
-        import urllib.error
         import ssl
+        import urllib.error
 
         def fake_urlopen(req, timeout=None, context=None):
             raise urllib.error.URLError(
@@ -996,12 +990,10 @@ class TestHttpPost:
 
     def test_timeout(self, monkeypatch):
         """Socket timeout returns None + network guidance."""
-        from unittest.mock import MagicMock
         import urllib.error
-        import socket
 
         def fake_urlopen(req, timeout=None, context=None):
-            raise urllib.error.URLError(socket.timeout("timed out"))
+            raise urllib.error.URLError(TimeoutError("timed out"))
 
         monkeypatch.setattr(oh.urllib.request, "urlopen", fake_urlopen)
 
@@ -1012,9 +1004,8 @@ class TestHttpPost:
 
     def test_dns_failure(self, monkeypatch):
         """DNS failure returns None + network guidance."""
-        from unittest.mock import MagicMock
-        import urllib.error
         import socket
+        import urllib.error
 
         def fake_urlopen(req, timeout=None, context=None):
             raise urllib.error.URLError(
@@ -1066,8 +1057,8 @@ XML_UPDATE_126 = (
 
 def _args(**overrides):
     from types import SimpleNamespace
-    base = dict(beta=False, verbose=False, test=False, yes=True,
-                ip="1.2.3.4", password=None, reflash=False)
+    base = {"beta": False, "verbose": False, "test": False, "yes": True,
+            "ip": "1.2.3.4", "password": None, "reflash": False}
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -1666,7 +1657,7 @@ class TestSnmpFailureClassification:
         monkeypatch.setattr("sys.argv", ["oh-brother.py", "--yes", "1.2.3.4"])
 
         code = oh.main()
-        err = capsys.readouterr().err
+        _err = capsys.readouterr().err
 
         assert code == oh.EXIT_ERROR == 1
         assert code != oh.EXIT_PRINTER
@@ -1895,8 +1886,8 @@ class TestBoundedDownload:
 
     def _arm(self, monkeypatch, tmp_path, content_length, chunks):
         """Arms a mocked download. Returns a list recording each read()."""
-        from unittest.mock import MagicMock
         from types import SimpleNamespace
+        from unittest.mock import MagicMock
 
         remaining = list(chunks) + [b'']
         reads = []
@@ -2116,8 +2107,8 @@ class TestFtpUploadOutcome:
 
     def test_quit_failure_does_not_lose_a_completed_stor(
             self, monkeypatch, tmp_path):
-        from unittest.mock import MagicMock
         from types import SimpleNamespace
+        from unittest.mock import MagicMock
 
         oh.args = SimpleNamespace(
             beta=False, verbose=False, test=False, yes=True, reflash=True,
@@ -2907,7 +2898,7 @@ class TestConditionalReuse:
         monkeypatch.setattr(oh.urllib.request, "urlopen", fake_urlopen)
 
         result = oh.update_firmware("MAIN", "1.24")
-        out = capsys.readouterr().out
+        _out = capsys.readouterr().out
 
         assert result == oh.EXIT_OK
         assert len(attempts) == 2
@@ -3076,7 +3067,7 @@ class TestBoundedWalkGap:
         monkeypatch.setattr(oh, "_snmp_walk_table", self._slow_walk())
         monkeypatch.setattr(oh, "SNMP_DEADLINE", 0.05)
 
-        status, actual = oh._verify_flash(
+        status, _actual = oh._verify_flash(
             "1.2.3.4", "public", "MAIN", "1.24", timeout=0.2, poll=0.01)
 
         assert status == "unverified"

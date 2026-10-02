@@ -14,29 +14,36 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 
-from pysnmp.hlapi.v1arch import (
-    walk_cmd, CommunityData, UdpTransportTarget,
-    ObjectType, ObjectIdentity, SnmpDispatcher,
-)
-import urllib.request, urllib.error, urllib.parse
-import http.client
-import xml.etree.ElementTree as ET
 import argparse
-from importlib.metadata import version as _dist_version, PackageNotFoundError
-import re
 import asyncio
-import sys
-import io
 import hashlib
+import http.client
+import io
+import os
+import re
 import socket
 import ssl
-import os
+import sys
+import tempfile
 import time
 import traceback
-import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from ftplib import FTP, all_errors
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
 from urllib.parse import urlparse
 
+from pysnmp.hlapi.v1arch import (
+    CommunityData,
+    ObjectIdentity,
+    ObjectType,
+    SnmpDispatcher,
+    UdpTransportTarget,
+    walk_cmd,
+)
 
 # Yes indeed, "SELIALNO"
 # (as used both in this here document and in script parts below)
@@ -405,7 +412,7 @@ def _validate_firmware_url(url):
     if not any(host == d or host.endswith('.' + d) for d in allowed_domains):
         return False, "unexpected domain: %s" % parsed.netloc
     path = parsed.path.lower()
-    if not (path.endswith('.djf') or path.endswith('.upd')):
+    if not path.endswith(('.djf', '.upd')):
         return False, "unexpected file type: %s" % parsed.path
     return True, None
 
@@ -733,7 +740,11 @@ def _query_printer_version(ip, community, cat):
         table = asyncio.run(asyncio.wait_for(
             _snmp_walk_table(ip, community, BROTHER_SNMP_OID), SNMP_DEADLINE,
         ))
-    except Exception:
+    except Exception:  # noqa: BLE001 -- see below
+        # Deliberately broad: any SNMP failure (SnmpError, TimeoutError, or a
+        # transport error) means the same thing here — the printer is silent,
+        # most likely still rebooting. Narrowing this would only add ways to
+        # crash the post-flash check.
         return None
     info = parse_snmp_table(table)
     for fw in info['firmwares']:
@@ -803,7 +814,7 @@ def _printer_ready(ip, community):
         table = asyncio.run(asyncio.wait_for(
             _snmp_walk_table(ip, community, BROTHER_SNMP_OID), SNMP_DEADLINE,
         ))
-    except Exception:
+    except Exception:  # noqa: BLE001 -- every SNMP failure means "not ready"
         return False
     return bool(table)
 
@@ -914,8 +925,6 @@ def _printer_port_open(ip, port, timeout):
 
 
 def update_firmware(cat, version):
-  global args
-
   # R7: never interpolate model/spec=None into the vendor XML.
   forced = (getattr(args, 'category', None) and
             getattr(args, 'fw_version', None) and
@@ -1012,13 +1021,13 @@ def update_firmware(cat, version):
   # is open, not that the printer will accept an image. Refusing here would
   # only remove the retained-image path for an offline printer. --test must
   # still fetch a backup, and --password selects FTP, where 9100 is irrelevant.
-  if not args.test and not args.password:
-    if not _printer_port_open(args.ip, 9100, PREFLIGHT_TIMEOUT):
-      print('WARNING: the printer at %s:9100 did not accept a TCP connect.'
-            % args.ip)
-      print('The upload will likely fail. The download will continue so the '
-            'firmware image is retained for a later retry.')
-      print('An administrator password (FTP) upload path is unaffected.')
+  if (not args.test and not args.password
+      and not _printer_port_open(args.ip, 9100, PREFLIGHT_TIMEOUT)):
+    print('WARNING: the printer at %s:9100 did not accept a TCP connect.'
+          % args.ip)
+    print('The upload will likely fail. The download will continue so the '
+          'firmware image is retained for a later retry.')
+    print('An administrator password (FTP) upload path is unaffected.')
 
   # Resolve the retained-image location and make it usable ONCE, before the
   # ~15 MB download. Discovering an unwritable backup root after the transfer
@@ -1586,7 +1595,7 @@ def main() -> int:
         print('Interrupted.')
         return EXIT_INTERRUPTED
 
-    except Exception:
+    except Exception:  # noqa: BLE001 -- top-level catch-all, mapped to an exit code
         # R17: an exit code on its own is thin evidence for a failure nobody
         # watched. --verbose gets the full traceback; otherwise just the frame
         # that raised. Note the negative limit: a positive one prints the

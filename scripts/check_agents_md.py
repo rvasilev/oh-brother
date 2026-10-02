@@ -15,6 +15,7 @@ import pathlib
 import re
 import subprocess
 import sys
+
 import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -51,6 +52,10 @@ STALE_PHRASES = [
     "update loop with cooldown",
     "3.10 compatible but untested",
     "downloads then deletes",
+    # R16 and R18 actually shipped in Packet 4/P7, but the Known-issues table
+    # kept listing them as open. Guard against that regression returning.
+    "No reachability preflight before the ~15 MB download",
+    "Unused `ip` parameter in `_tcp_upload`",
 ]
 
 
@@ -91,7 +96,7 @@ def main() -> int:
     else:
         got = subprocess.run(
             ["bash", "-c", f"head -15 {SOURCE} | md5sum | cut -d' ' -f1"],
-            capture_output=True, text=True).stdout.strip()
+            capture_output=True, text=True, check=False).stdout.strip()
         if got != m.group(1):
             problems.append(f"header md5 claim {m.group(1)} != actual {got}")
 
@@ -154,7 +159,8 @@ def main() -> int:
     # 9. test counts and the per-class table
     out = subprocess.run([sys.executable, "-m", "pytest", "tests/",
                           "--collect-only", "-q"],
-                         capture_output=True, text=True, cwd=ROOT).stdout
+                         capture_output=True, text=True, cwd=ROOT,
+                         check=False).stdout
     collected = [ln for ln in out.splitlines() if "::" in ln]
     perclass: dict[str, int] = {}
     for ln in collected:
