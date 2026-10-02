@@ -294,7 +294,7 @@ reproduced before being acted on.
 (SNMP/XML/raw-port), git manipulation, real-printer integration tests.
 
 **Verification:** Every AI-assisted change is read, compiled, tested
-(`python3 -m pytest tests/ -q`, 91 tests), and reviewed as a diff before commit.
+(`python3 -m pytest tests/ -q`, 177 tests), and reviewed as a diff before commit.
 Where AI proposed a fix, the test proving it was run against the *unfixed* source
 first to confirm it actually fails — a test that passes both before and after
 proves nothing. Behavioural correctness is verified against real printer SNMP
@@ -307,4 +307,4 @@ tests but is subtly wrong — particularly around async pysnmp 7.x semantics and
 TCP `sendfile` edge cases. The verification workflow catches most of this; it
 does not catch all of it. Bug reports are welcome and taken seriously.
 
-**Last reviewed:** 13/09/2026
+**Last reviewed:** 03/10/2026

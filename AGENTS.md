@@ -16,7 +16,7 @@ or FTP upload.
   must equal **`37f53a239b86f53d385d45047b8ceb07`**. If that changes, attribution
   was altered — restore it rather than reformatting around it.
 - **License:** GPLv2 (`GPL-2.0-only` in packaging, which matches the header)
-- **Lines:** ~1,550 in a single file (`oh_brother.py`)
+- **Lines:** ~1,600 in a single file (`oh_brother.py`)
 - **Version:** `0.4.0`, read at runtime via `importlib.metadata` (never a
   duplicated literal) with a `0.0.0+source` fallback when run uninstalled
 - **Installed as** the `oh-brother` console script via `pyproject.toml`
@@ -121,14 +121,14 @@ guessed interval.
 | `SnmpError(Exception)` | Carries `exit_code`, so the caller learns *why* rather than getting a traceback |
 | `prompt(msg)` | `input()` only when stdin is a TTY — and nothing in the flash path depends on that no-op any more |
 
-**Module constants (36):** `BROTHER_API_URL`, `BROTHER_SNMP_OID`,
+**Module constants (37):** `BROTHER_API_URL`, `BROTHER_SNMP_OID`,
 `FW_VERSION_SENTINEL`, the `EXIT_*` codes, `UPLOAD_OK`/`UPLOAD_FAILED`/
 `UPLOAD_INCOMPLETE`, `UPLOAD_SOCKET_TIMEOUT`, `UPLOAD_STALL_DEADLINE`,
 `FTP_TIMEOUT`, `HTTP_TIMEOUT`, `SNMP_TIMEOUT`/`SNMP_RETRIES`/`SNMP_DEADLINE`,
-`FLASH_VERIFY_TIMEOUT`/`FLASH_VERIFY_POLL`, `BACKUP_DIRNAME`,
-`BACKUP_DIR_ENV`, `SHA256_SUFFIX`, `VALIDATOR_SUFFIX`,
+`FLASH_VERIFY_TIMEOUT`/`FLASH_VERIFY_POLL`/`FLASH_REBOOT_GRACE`,
+`BACKUP_DIRNAME`, `BACKUP_DIR_ENV`, `SHA256_SUFFIX`, `VALIDATOR_SUFFIX`,
 `DOWNLOAD_CHUNK`/`DOWNLOAD_HARD_CAP`, `MIN_FIRMWARE_SIZE`,
-`READY_TIMEOUT`/`READY_POLL`, plus the
+`READY_TIMEOUT`/`READY_POLL`, `PREFLIGHT_TIMEOUT`, plus the
 `reqInfo` XML template. Every timeout is a named constant with the arithmetic
 written out in a comment — do not inline a duration.
 
@@ -278,17 +278,17 @@ error" when the tool returns structured exit codes.
 
 ## Testing
 
-**174 tests, 30 classes.** Run: `python3 -m pytest tests/ -q`
+**177 tests, 30 classes.** Run: `python3 -m pytest tests/ -q`
 
 | Class | Tests | What it covers |
 |---|---|---|
 | `TestCLI` | 20 (parameterized) | All boolean flags, string args, category+version combo, IP required, `--reflash`, `_version` fallback on malformed metadata |
 | `TestSafetyGates` | 10 | Default-deny: already-current terminal, non-TTY refusal, downgrade refusal, no-override-flag, 2-4 digit artifact parsing |
 | `TestValidateFirmwareUrl` | 8 | Valid HTTP/HTTPS, .upd, wrong domain, file://, wrong ext, empty, query params |
-| `TestSnmpFailureClassification` | 7 | Walk raises `SnmpError` instead of `sys.exit(1)`; off printer is exit 4, protocol error exit 1; bounded SNMP budget and deadline; rebooting printer tolerated |
+| `TestSnmpFailureClassification` | 9 | Walk raises `SnmpError` instead of `sys.exit(1)`; off printer is exit 4, protocol error exit 1; bounded SNMP budget and deadline; rebooting printer tolerated |
 | `TestParseSnmpTable` | 7 | Real printer data, multi-FW, ordering edge cases, empty table, verbose |
 | `TestMainSmoke` | 7 | SNMP pipeline, model/category override, SNMP errors, category+version, readiness poll between categories |
-| `TestFlashHardening` | 7 | Tri-state upload, image retention, partial-file promotion, post-flash verify |
+| `TestFlashHardening` | 8 | Tri-state upload, image retention, partial-file promotion, post-flash verify |
 | `TestDecrementVersion` | 7 | Normal, zero-padding preserved (`2.10`→`2.09`), zero minor borrows the major, non-numeric, empty |
 | `TestPrinterReadiness` | 6 | R11: readiness poll returns fast when up, bounded deadline when not, SNMP failure reads as not-ready |
 | `TestUpdateFirmware` | 6 | VCHECK=1, no-PATH, `--yes` skip, fallback succeed/fail, `--test` stops before upload |
@@ -411,8 +411,6 @@ leaves a silent 6× multiplier. When a budget is a product
 | Issue | Status |
 |---|---|
 | Downloads to CWD, not a temp dir | By design — that path *is* the retained recovery image (`firmware_backups/<MODEL>/<version>/`) |
-| No reachability preflight before the ~15 MB download (R16) | Unfixed (low — the image is retained, so it is waste, not loss) |
-| Unused `ip` parameter in `_tcp_upload` (R18) | Unfixed (cosmetic) |
 | Model name "series" suffix for D01 color lasers | Unfixed (enhancement — VCHECK=2 not handled) |
 | No `--json` output | Deferred until a second consumer actually exists |
 | Full `logging` refactor, full type hints, `--log-file`, `--dry-run` | Deferred by decision — exit codes already carry the cron signal |
@@ -431,3 +429,4 @@ leaves a silent 6× multiplier. When a budget is a product
 | Phase 5 | HTTP error handling: SSL cert guidance, 503/504 friendly messages, download error wrap |
 | Phase 6 | Simplification: fallback dedup, constants, clean imports, indentation |
 | Phase 7 | Production hardening (branch `harden`): default-deny flashing, frozen exit-code contract, image retention, post-upload verification, packaging + CI, Ctrl-C handling, bounded SNMP/upload/download budgets, readiness polling, and the R9/R10/R11/R12/R13/R14/R17 follow-ups |
+| Phase 8 | Repo audit (2026-10-03): pinned a reproducible `[tool.ruff]` lint gate + `dev` extra and wired `ruff` into CI; cleared every non-house-style lint finding (import order, unused imports/vars, nested-if, dead `global`, `endswith` tuple, explicit `subprocess` `check`); made the broad `except Exception` catches explicitly deliberate; and realigned AGENTS.md/README with the source. Records the already-shipped R16 reachability preflight and R18 dead-parameter cleanup (Packet 4/P7) that the Known-issues table still listed as open |
