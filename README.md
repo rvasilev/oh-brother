@@ -251,6 +251,39 @@ enabled in the printer's management interface. In order to send firmware
 updates via FTP, you must have first set an admin password on the
 printer via the web interface.
 
+### A silently ignored upload is usually "PJL Security"
+
+If the tool reports a completed upload but the printer's version never changes
+**and the printer never reboots**, check **PJL Security** in the printer's web
+interface (Administrator → Network → Security; wording varies by model) and set
+it to **Disabled**. It is **Enabled by default from the factory**, and when
+enabled the printer checks PJL arriving on port 9100 against a table of
+restricted commands and skips the **entire file** if any command in it is
+restricted — returning no error. The 15 MB transfer therefore completes and
+does nothing. PJL delivered over HTTPS or USB is exempt from the restriction;
+raw port 9100 is not.
+
+**Confirm the suspicion before changing anything.** `@PJL DEFAULT` is a
+restricted (state-changing) command; `@PJL DINQUIRE` is a read-only query that
+is allowed either way. Send `@PJL DEFAULT ECONOMODE=ON` and then
+`@PJL DINQUIRE ECONOMODE` to port 9100 — if the value flips from `OFF` to `ON`,
+restricted writes are landing. Restore it afterwards. Do **not** probe with
+`RDYMSG`/`OPMSG`: a sleeping control panel overrides the display message, so no
+visible change proves nothing.
+
+**The setting-independent oracle is uptime.** A Brother always reboots to
+commit an image, so:
+
+    snmpget -v2c -c public <printer IP> 1.3.6.1.2.1.1.3.0
+
+A rising uptime after an upload means nothing was written. A reset means it
+was. Trust that over any tool's own verdict.
+
+Leaving PJL Security disabled weakens the printer: any client on the network
+can change its settings, and PJL on port 9100 is a known crash surface.
+Disable it for the update and re-enable it afterwards, or restrict port 9100 at
+the network instead.
+
 ## Use ``--category``
 
 Try specifying ``--category`` on the command line.  E.g.:

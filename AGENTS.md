@@ -141,8 +141,17 @@ Module is import-safe: `if __name__ == '__main__':` guard.
 | Brother firmware API | HTTPS XML | `BROTHER_API_URL`, requires `User-Agent: BrHttpc/1.00` |
 | Brother firmware CDN | HTTP | `update-akamai.brother.co.jp/CS/` — `.djf` / `.upd` files |
 | Printer SNMP | UDP 161 | Community string (default `public`), `BROTHER_SNMP_OID` |
-| Printer raw port | TCP 9100 | Must be enabled in printer web UI |
+| Printer raw port | TCP 9100 | Must be enabled in the printer web UI, **and PJL Security set to Disabled** — when enabled (the factory default) the printer silently skips any PJL file containing a restricted command, so the upload completes and does nothing |
 | Printer FTP | TCP 21 | Admin password sent as FTP username (Brother quirk) |
+
+**A silently ignored 9100 upload is a printer setting, not a tool failure.** If
+the upload completes and the version never changes and the printer never
+reboots, check PJL Security (see the table row above). Verified 2026-10-03: with
+it disabled, `--yes --beta` flashed an HL-L2865DW 1.24 → 1.26 on the first
+attempt. The setting-independent oracle is the uptime OID
+(`1.3.6.1.2.1.1.3.0`) — a Brother always reboots to commit an image, so a rising
+`sysUpTime` proves nothing was written. Two README sections carry the full
+recipe: "If it doesn't work for you".
 
 ## Code conventions
 
