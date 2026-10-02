@@ -52,3 +52,9 @@ jobs:
       # suppressions, not oversights. See .aislop/config.yml.
       - name: Lint (ruff)
         run: ruff check .
+
+      # Formatting is enforced, not optional: quote-style and the *.md exclude
+      # live in [tool.ruff.format]. The commit that first applied it is listed
+      # in .git-blame-ignore-revs.
+      - name: Format check (ruff)
+        run: ruff format --check .

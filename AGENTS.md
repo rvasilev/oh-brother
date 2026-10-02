@@ -16,7 +16,7 @@ or FTP upload.
   must equal **`37f53a239b86f53d385d45047b8ceb07`**. If that changes, attribution
   was altered — restore it rather than reformatting around it.
 - **License:** GPLv2 (`GPL-2.0-only` in packaging, which matches the header)
-- **Lines:** ~1,600 in a single file (`oh_brother.py`)
+- **Lines:** ~1,650 in a single file (`oh_brother.py`)
 - **Version:** `0.4.0`, read at runtime via `importlib.metadata` (never a
   duplicated literal) with a `0.0.0+source` fallback when run uninstalled
 - **Installed as** the `oh-brother` console script via `pyproject.toml`
@@ -155,6 +155,16 @@ Module is import-safe: `if __name__ == '__main__':` guard.
 - **`asyncio.run()` wrapper** — the CLI stays synchronous despite async SNMP
 - **Procedural style** — pure functions, module-level globals (`args`, `model`,
   `spec`, `firmInfo`, `serial`)
+- **Formatting is `ruff format`** — configured in `[tool.ruff.format]`:
+  `quote-style = "single"` (upstream's style) and `*.md` excluded so dated
+  records in `docs/` are never rewritten. Run `ruff format .`; CI runs
+  `ruff format --check .`. The sweep commit is listed in
+  `.git-blame-ignore-revs` — enable it locally with
+  `git config blame.ignoreRevsFile .git-blame-ignore-revs`.
+  **A test must not assert on the literal source text of its own helper**: the
+  quote normalisation rewrote `raise ValueError("boom")` to
+  `raise ValueError('boom')` and broke three `TestFailureTraceback` asserts.
+  Assert on the stable part (`raise ValueError(`), not the spelling.
 - **No external HTTP libraries** — stdlib `urllib` only; runtime deps are pysnmp
   and nothing else
 - **XML parsing** — stdlib `xml.etree.ElementTree`
